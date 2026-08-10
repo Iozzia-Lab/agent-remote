@@ -1,0 +1,19 @@
+# Firmware secrets
+firmware/config.h
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Python
+bridge/__pycache__/
+bridge/*.pyc
+.venv/
+venv/
+
+# Local bridge config (contains device host / preferences)
+bridge/agent-remote.config.json
+
+# OS
+.DS_Store

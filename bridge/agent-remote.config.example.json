@@ -1,0 +1,10 @@
+{
+  "device_host": "agent-remote.local",
+  "port": 80,
+  "gate_tools": ["Bash", "Write", "Edit", "NotebookEdit", "WebFetch"],
+  "timeout_s": 120,
+  "poll_s": 0.5,
+  "options": ["Approve", "Deny"],
+  "allow_label": "Approve",
+  "deny_label": "Deny"
+}

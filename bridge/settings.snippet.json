@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|NotebookEdit|WebFetch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /ABSOLUTE/PATH/TO/agent-remote/bridge/hook.py",
+            "timeout": 150,
+            "statusMessage": "Waiting for approval on your device..."
+          }
+        ]
+      }
+    ]
+  }
+}
