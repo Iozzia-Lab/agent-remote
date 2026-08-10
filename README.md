@@ -43,43 +43,36 @@ carry, so nobody else on the WiFi can drive your agent.
 
 | Path | What |
 |------|------|
-| `firmware/` | Core2 Arduino sketch (M5Unified). The touchscreen UI + HTTP server. |
-| `bridge/`   | Python hook + installer that plug into Claude Code. |
-| `docs/`     | `PROTOCOL.md` — the HTTP contract between hook and device. |
+| `firmware/`           | PlatformIO project for the Core2 (M5Unified). `src/main.cpp` is the current build. |
+| `firmware/reference/` | The full target design (WiFi portal + pairing + approval server), being ported into `src/` incrementally. |
+| `bridge/`             | Python hook + installer that plug into Claude Code. |
+| `docs/`               | `PROTOCOL.md` — the HTTP contract between hook and device. |
+
+## Status
+
+Built incrementally: **① start screen ✅ → ② on-device WiFi setup → ③ pairing +
+approval server.** `src/main.cpp` currently draws the start screen; the WiFi and
+server layers (designed in `firmware/reference/`) are being added on top.
 
 ## Setup
 
-### 1. Flash the Core2
-
-Using **PlatformIO** (recommended):
+### 1. Flash the Core2 — use PlatformIO
 
 ```bash
 cd firmware
-cp config.example.h config.h      # device name / UX only — no secrets
 pio run -t upload && pio device monitor
 ```
 
-Or **Arduino IDE**: open `firmware/agent-remote.ino`, install the **M5Unified**
-and **ArduinoJson** libraries, select board **M5Core2**, copy `config.example.h`
-to `config.h`, and upload.
+> ⚠️ **Build with PlatformIO, not arduino-cli.** On at least one dev machine the
+> `arduino-cli` ESP32 toolchain produced binaries that boot-loop on real Core2
+> hardware (infinite exception-vector recursion), while PlatformIO's
+> self-contained toolchain compiles working firmware. The platform is pinned to
+> `espressif32@6.4.0` (arduino-esp32 2.0.11 / IDF 4.4), matching the Core2
+> factory firmware. If your board enumerates on a specific port, pass
+> `--upload-port /dev/cu.usbserial-XXXX` (find it with `pio device list`).
 
-Or **arduino-cli**:
-
-```bash
-arduino-cli core install esp32:esp32
-arduino-cli lib install M5Unified ArduinoJson
-cp firmware/config.example.h firmware/config.h
-# sketch folder name must match the .ino, so build a matching copy:
-mkdir -p /tmp/agent-remote && cp firmware/agent-remote.ino firmware/config.h /tmp/agent-remote/
-arduino-cli compile --fqbn esp32:esp32:m5stack_core2 /tmp/agent-remote
-arduino-cli upload -p /dev/cu.usbserial-XXXX --fqbn esp32:esp32:m5stack_core2 /tmp/agent-remote
-```
-
-WiFi credentials are **not** in `config.h` — you set those on the device in
-step 2 below.
-
-On first boot the screen shows **agent-remote / No WiFi** and a **Settings**
-button.
+Once the later steps land, WiFi credentials are set **on the device** (no secrets
+in the repo), and the first boot shows the **Agent-remote** start screen.
 
 ### 2. Connect the device to WiFi (on the device)
 

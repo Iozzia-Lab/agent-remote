@@ -28,6 +28,10 @@
 
 #include "config.h"
 
+// NOTE: the loop-task stack is enlarged to 16 KB in loop_stack.cpp — this app
+// runs WiFi + WebServer + DNSServer + mDNS + JSON + M5GFX all in the loop task,
+// which overflows the default 8 KB stack (Guru Meditation: stack canary).
+
 WebServer  server(HTTP_PORT);
 DNSServer  dns;
 Preferences prefs;
@@ -57,7 +61,8 @@ PairState pairState = PAIR_NONE;
 String pairClient;               // hostname of the computer trying to pair
 String pairToken;                // token handed back once approved
 
-// ---- WiFi portal state ----
+// ---- Server / WiFi portal state ----
+bool   serverStarted = false;    // server.begin() only after a netif is up
 bool   apMode = false;
 String scanHtml;                 // cached <option> list
 uint32_t exitApAt = 0;           // teardown time after a successful save
@@ -107,6 +112,8 @@ void wake();
 bool connectSaved(uint32_t timeoutMs);
 void startAp();
 void stopAp();
+void ensureServer();
+void startMdns();
 void sendJson(int code, const String& body);
 bool authed();
 String randomToken();
@@ -303,8 +310,8 @@ bool connectSaved(uint32_t timeoutMs) {
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) delay(200);
   if (WiFi.isConnected()) {
-    MDNS.end();
-    if (MDNS.begin(DEVICE_HOSTNAME)) MDNS.addService("http", "tcp", HTTP_PORT);
+    startMdns();
+    ensureServer();      // safe now: STA interface is up
     return true;
   }
   return false;
@@ -324,6 +331,7 @@ void startAp() {
     scanHtml += "<option value=\"" + ss + "\">" + ss + "</option>";
   }
   apMode = true;
+  ensureServer();        // safe now: SoftAP interface is up (serves the portal)
 }
 
 void stopAp() {
@@ -331,6 +339,21 @@ void stopAp() {
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
   apMode = false;
+}
+
+// Start the HTTP server exactly once, and only after a network interface is up
+// (STA connected or SoftAP started). Calling server.begin() with no live netif
+// asserts inside lwip (queue.c: null mutex). Routes are registered in setup().
+void ensureServer() {
+  if (serverStarted) return;
+  server.begin();
+  serverStarted = true;
+  Serial.println("[agent-remote] http server started");
+}
+
+void startMdns() {
+  MDNS.end();
+  if (MDNS.begin(DEVICE_HOSTNAME)) MDNS.addService("http", "tcp", HTTP_PORT);
 }
 
 // =============================================================================
@@ -483,8 +506,8 @@ void handleWifiSave() {
     server.send(200, "text/html",
       "<h2>Connected!</h2><p>IP: " + ip + "</p><p>This device is now on your WiFi. "
       "You can close this page.</p>");
-    MDNS.end();
-    if (MDNS.begin(DEVICE_HOSTNAME)) MDNS.addService("http", "tcp", HTTP_PORT);
+    startMdns();
+    ensureServer();               // already running from AP, but safe/idempotent
     exitApAt = millis() + 2000;   // tear down AP shortly, then go home
   } else {
     server.send(200, "text/html", "<h2>Could not connect.</h2><p><a href='/'>Try again</a></p>");
@@ -571,22 +594,26 @@ void handleTouch() {
 // Setup / loop
 // =============================================================================
 void setup() {
+  Serial.begin(115200);
+  delay(50);
+  Serial.println("[agent-remote] setup: start");
+
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.Display.setBrightness(200);
   M5.Speaker.setVolume(120);
+  Serial.println("[agent-remote] M5 begun");
 
   prefs.begin("agentremote", false);
   wifiSsid = prefs.getString("ssid", "");
   wifiPass = prefs.getString("pass", "");
   token    = prefs.getString("token", "");
   paired   = !token.isEmpty();
+  Serial.printf("[agent-remote] prefs: ssid='%s' paired=%d\n", wifiSsid.c_str(), paired); Serial.flush();
 
-  M5.Display.fillScreen(COL_BG);
-  drawCentered("agent-remote", 160, 110, 3, COL_TEXT);
-  drawCentered(wifiSsid.isEmpty() ? "starting..." : "connecting wifi...", 160, 145, 1, COL_DIM);
-  connectSaved(12000);
-
+  // Register routes now, but DON'T begin() yet — the server is started later by
+  // ensureServer(), once STA is connected or the SoftAP is up. Starting it with
+  // no live network interface asserts inside lwip.
   const char* headers[] = { "X-Agent-Token" };
   server.collectHeaders(headers, 1);
   server.on("/ping", handlePing);
@@ -598,16 +625,23 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/wifisave", HTTP_POST, handleWifiSave);
   server.onNotFound(handleNotFound);
-  server.begin();
+
+  M5.Display.fillScreen(COL_BG);
+  drawCentered("agent-remote", 160, 110, 3, COL_TEXT);
+  drawCentered(wifiSsid.isEmpty() ? "starting..." : "connecting wifi...", 160, 145, 1, COL_DIM);
+  connectSaved(12000);   // starts server + mDNS if it connects
+  Serial.printf("[agent-remote] wifi connected=%d ip=%s\n",
+                WiFi.isConnected(), WiFi.localIP().toString().c_str());
 
   lastActivity = millis();
   screen = SCR_HOME;
   redraw();
+  Serial.println("[agent-remote] setup: done");
 }
 
 void loop() {
   M5.update();
-  server.handleClient();
+  if (serverStarted) server.handleClient();
   if (apMode) dns.processNextRequest();
   handleTouch();
 
