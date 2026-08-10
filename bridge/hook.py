@@ -26,6 +26,8 @@ DEFAULTS = {
     # mDNS name from firmware/config.h, or a raw IP like "192.168.1.42".
     "device_host": "agent-remote.local",
     "port": 80,
+    # Pairing token (written by pair.py). Empty until you pair the device.
+    "token": "",
     # Only these tools are sent to the device; everything else defers to
     # Claude's normal flow (so reads/searches never make you tap).
     "gate_tools": ["Bash", "Write", "Edit", "NotebookEdit", "WebFetch"],
@@ -61,11 +63,13 @@ def base_url(cfg):
     return f"http://{cfg['device_host']}:{cfg['port']}"
 
 
-def http_json(url, payload=None, method="GET", timeout=4):
+def http_json(url, payload=None, method="GET", timeout=4, token=None):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     if data is not None:
         req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("X-Agent-Token", token)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode() or "{}")
 
@@ -132,8 +136,19 @@ def main():
     }
 
     url = base_url(cfg)
+    tok = cfg.get("token") or None
+    if not tok:
+        log("no pairing token in config; run bridge/pair.py. Deferring.")
+        defer()
+
     try:
-        http_json(f"{url}/request", payload, method="POST")
+        http_json(f"{url}/request", payload, method="POST", token=tok)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            log("device rejected token (401) — re-pair with bridge/pair.py. Deferring.")
+        else:
+            log(f"device error {e.code}; deferring")
+        defer()
     except (urllib.error.URLError, OSError) as e:
         log(f"device unreachable ({e}); deferring to normal prompt")
         defer()
@@ -143,7 +158,7 @@ def main():
     choice = None
     while time.time() < deadline:
         try:
-            status = http_json(f"{url}/status?id={req_id}")
+            status = http_json(f"{url}/status?id={req_id}", token=tok)
         except (urllib.error.URLError, OSError):
             time.sleep(cfg["poll_s"])
             continue
@@ -155,7 +170,7 @@ def main():
     if choice is None:
         log("no answer before timeout; clearing device and deferring")
         try:
-            http_json(f"{url}/clear", {}, method="POST")
+            http_json(f"{url}/clear", {}, method="POST", token=tok)
         except Exception:
             pass
         defer()

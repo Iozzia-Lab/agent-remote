@@ -1,21 +1,19 @@
-// Copy this file to `config.h` and fill in your values.
-// config.h is git-ignored so your WiFi credentials stay private.
+// Copy this file to `config.h` before building.
+// WiFi credentials are NOT here anymore — you set those on the device itself
+// (Settings > WiFi Setup). This file is just device identity + UX.
 #pragma once
 
-// ---- WiFi ----
-#define WIFI_SSID     "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
-
-// ---- Device identity ----
-// The Mac-side hook finds the device at http://<HOSTNAME>.local
-// (mDNS/Bonjour). Keep it short and lowercase.
+// mDNS name: the Mac-side hook finds the device at http://<HOSTNAME>.local
 #define DEVICE_HOSTNAME "agent-remote"
 
 // HTTP port the device listens on.
 #define HTTP_PORT 80
 
-// ---- UX ----
-// Play a chime + screen wake when a new request arrives.
-#define ENABLE_CHIME  true
+// SSID of the temporary setup hotspot shown during WiFi Setup.
+#define SETUP_AP_NAME "agent-remote-setup"
+
+// Play a chime + wake the screen when a new request/pair prompt arrives.
+#define ENABLE_CHIME true
+
 // Screen auto-dims after this many ms of inactivity (0 = never).
 #define SCREEN_DIM_MS 30000

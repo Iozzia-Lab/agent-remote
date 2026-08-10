@@ -22,16 +22,22 @@ built on a cheap ESP32 device you probably already have.
 
 1. The Core2 runs a tiny HTTP server on your WiFi (`agent-remote.local`).
 2. A **PreToolUse hook** in Claude Code fires before a gated tool runs. It POSTs
-   the request to the device and blocks, polling for your answer.
+   the request (with your pairing token) to the device and blocks, polling for
+   your answer.
 3. The device chimes, wakes the screen, and shows the prompt with tappable
    buttons.
 4. You tap. The hook reads the choice and returns `allow` / `deny` to Claude
    Code, which continues.
 
-If the device is off, asleep, or you don't answer in time, the hook **fails
-open** — Claude just prompts on-screen as normal. It can never lock you out.
+If the device is off, asleep, unreachable, or you don't answer in time, the hook
+**fails open** — Claude just prompts on-screen as normal. It can never lock you
+out.
 
 Everything stays on your LAN. No cloud, no broker, no account.
+
+**WiFi is set up on the device** (touchscreen → captive portal), so no
+credentials live in the repo. **Pairing** mints a token that every request must
+carry, so nobody else on the WiFi can drive your agent.
 
 ## Repo layout
 
@@ -49,7 +55,7 @@ Using **PlatformIO** (recommended):
 
 ```bash
 cd firmware
-cp config.example.h config.h      # fill in WiFi SSID/password
+cp config.example.h config.h      # device name / UX only — no secrets
 pio run -t upload && pio device monitor
 ```
 
@@ -57,34 +63,71 @@ Or **Arduino IDE**: open `firmware/agent-remote.ino`, install the **M5Unified**
 and **ArduinoJson** libraries, select board **M5Core2**, copy `config.example.h`
 to `config.h`, and upload.
 
-On boot the screen shows the device IP and `waiting for agent...`. Note the IP
-(or rely on `agent-remote.local` via Bonjour, which macOS supports natively).
-
-### 2. Smoke-test the link
-
-From your Mac, on the same WiFi:
+Or **arduino-cli**:
 
 ```bash
-python3 bridge/send-test.py agent-remote.local
-# or:  python3 bridge/send-test.py 192.168.1.42
+arduino-cli core install esp32:esp32
+arduino-cli lib install M5Unified ArduinoJson
+cp firmware/config.example.h firmware/config.h
+# sketch folder name must match the .ino, so build a matching copy:
+mkdir -p /tmp/agent-remote && cp firmware/agent-remote.ino firmware/config.h /tmp/agent-remote/
+arduino-cli compile --fqbn esp32:esp32:m5stack_core2 /tmp/agent-remote
+arduino-cli upload -p /dev/cu.usbserial-XXXX --fqbn esp32:esp32:m5stack_core2 /tmp/agent-remote
+```
+
+WiFi credentials are **not** in `config.h` — you set those on the device in
+step 2 below.
+
+On first boot the screen shows **agent-remote / No WiFi** and a **Settings**
+button.
+
+### 2. Connect the device to WiFi (on the device)
+
+Tap **Settings → WiFi Setup**. The device starts a temporary hotspot:
+
+1. On your phone, join WiFi **`agent-remote-setup`**
+2. Open **http://192.168.4.1**
+3. Pick your network (2.4 GHz) and enter the password
+
+The device connects and remembers it across reboots. The status bar shows its
+IP. macOS can also reach it at `agent-remote.local` (Bonjour).
+
+### 3. Pair your computer with the device
+
+On the device tap **Settings → Pair Agent** (opens a 90-second window), then on
+your Mac:
+
+```bash
+python3 bridge/pair.py
+# or:  python3 bridge/pair.py 192.168.1.42
+```
+
+The device shows **"Pair with `<your-mac>`? Approve / Deny"**. Tap **Approve**.
+The token is saved to `bridge/agent-remote.config.json`.
+
+### 4. Smoke-test the link
+
+```bash
+python3 bridge/send-test.py
 ```
 
 The device should chime and show a test prompt. Tap a button — the script prints
 what you tapped. If this works, the hard part is done.
 
-### 3. Install the Claude Code hook
+### 5. Install the Claude Code hook
 
 ```bash
 python3 bridge/install.py
 ```
 
-This merges the hook into `~/.claude/settings.json` (with a backup) and creates
-`bridge/agent-remote.config.json`. Edit that file if you use a raw IP instead of
-mDNS, or to change which tools require approval:
+This merges the hook into `~/.claude/settings.json` (with a backup). Edit
+`bridge/agent-remote.config.json` to use a raw IP instead of mDNS, or to change
+which tools require approval:
 
 ```json
 {
   "device_host": "agent-remote.local",
+  "token": "…set by pair.py…",
   "gate_tools": ["Bash", "Write", "Edit", "NotebookEdit", "WebFetch"],
   "timeout_s": 120
 }
@@ -109,11 +152,13 @@ To remove: `python3 bridge/install.py --remove`.
 
 ## Roadmap
 
+- [x] On-device WiFi setup (captive portal)
+- [x] Pairing + per-request token auth
 - [ ] `Notification` hook → push "Claude is idle / needs input" to the device
 - [ ] Multi-option prompts (e.g. Approve / Approve-all / Deny)
 - [ ] Adapters for Codex CLI and Grok CLI approval flows
 - [ ] On-device history of recent decisions
-- [ ] Optional cloud/MQTT transport for off-network use
+- [ ] Optional cloud/MQTT transport for off-network use (walk-the-dog range)
 
 ## License
 
