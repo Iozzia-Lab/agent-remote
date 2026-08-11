@@ -43,7 +43,10 @@ String wifiSsid, wifiPass, connectedIP;
 // ---- request state ----
 enum ReqState { REQ_NONE, REQ_PENDING, REQ_ANSWERED };
 ReqState reqState = REQ_NONE;
-String   reqId, reqTitle, reqSummary, reqChoice, reqOptA = "Approve", reqOptB = "Deny";
+String   reqId, reqTitle, reqSummary, reqChoice, reqContext;
+String   reqOptions[4];         // up to 4 choices (approval or multiple-choice)
+int      reqOptionCount = 0;
+bool     reqCloud = false;      // request came from a cloud/Cowork session
 uint32_t answeredAt = 0;
 
 // ---- pairing / auth state ----
@@ -57,6 +60,7 @@ String pairClient, pairToken;
 
 struct Box { int x, y, w, h; };
 Box bSetup, bCancel, bNext, bBack, bRedo, bApprove, bDeny, bPair;
+Box reqOptBox[4];               // hit-boxes for the request option buttons
 
 // forward decls
 void centerText(const char* s, int cx, int cy, int size, uint16_t fg);
@@ -190,20 +194,52 @@ void drawPair() {
   }
 }
 
-// Approval prompt (or the brief "Sent" confirmation).
+// Color a choice by its label: approve-ish green, deny-ish red, else neutral.
+uint16_t optColor(const String& label) {
+  String l = label; l.toLowerCase();
+  if (l.indexOf("approve") >= 0 || l.indexOf("allow") >= 0 || l.indexOf("yes") >= 0 || l.indexOf("ok") >= 0)
+    return C_GREEN;
+  if (l.indexOf("deny") >= 0 || l.indexOf("reject") >= 0 || l.indexOf("block") >= 0 || l.indexOf("no") == 0)
+    return C_RED;
+  return 0x3D9F;   // neutral blue
+}
+
+// Approval / multiple-choice prompt (or the brief "Sent" confirmation).
 void drawRequest() {
   M5.Display.fillScreen(C_BLACK);
-  M5.Display.setFont(&fonts::Font0);
-  M5.Display.setTextSize(2); M5.Display.setTextColor(C_CYAN, C_BLACK);
-  M5.Display.setCursor(12, 10); M5.Display.print(reqTitle);
 
-  if (reqState == REQ_PENDING) {
-    bodyText(12, 46, reqSummary.c_str(), C_WHITE);   // wraps within screen width
-    bApprove = drawButton(14, 166, 140, 64, reqOptA.c_str(), C_GREEN);
-    bDeny    = drawButton(166, 166, 140, 64, reqOptB.c_str(), C_RED);
+  if (reqState != REQ_PENDING) {
+    centerText("Sent", 160, 108, 2, C_LTGREY);
+    centerText(reqChoice.c_str(), 160, 150, 3, optColor(reqChoice));
+    return;
+  }
+
+  // Context label (top-left), cloud marker (top-right).
+  String ctx = reqContext.length() ? reqContext : "agent";
+  if (ctx.length() > 24) ctx = ctx.substring(0, 23) + "~";
+  M5.Display.setFont(&fonts::Font0);
+  M5.Display.setTextSize(2); M5.Display.setTextColor(C_YELLOW, C_BLACK);
+  M5.Display.setCursor(10, 8); M5.Display.print(ctx);
+  if (reqCloud) {
+    M5.Display.setTextSize(1); M5.Display.setTextColor(C_CYAN, C_BLACK);
+    M5.Display.setCursor(278, 6); M5.Display.print("CLOUD");
+  }
+
+  // Tool / question header + the command / question text.
+  M5.Display.setTextSize(2); M5.Display.setTextColor(C_CYAN, C_BLACK);
+  M5.Display.setCursor(10, 34); M5.Display.print(reqTitle);
+  bodyText(12, 62, reqSummary.c_str(), C_WHITE);   // wraps within screen width
+
+  // Option buttons: 2 -> big side-by-side; 3-4 -> stacked full-width list.
+  int n = reqOptionCount;
+  if (n <= 2) {
+    int y = 168, h = 64;
+    reqOptBox[0] = drawButton(14, y, 140, h, reqOptions[0].c_str(), optColor(reqOptions[0]));
+    if (n == 2) reqOptBox[1] = drawButton(166, y, 140, h, reqOptions[1].c_str(), optColor(reqOptions[1]));
   } else {
-    centerText("Sent", 160, 110, 2, C_LTGREY);
-    centerText(reqChoice.c_str(), 160, 150, 3, reqChoice == reqOptB ? C_RED : C_GREEN);
+    int top = 104, gap = 6, h = (240 - top - 8 - (n - 1) * gap) / n;
+    for (int i = 0; i < n; i++)
+      reqOptBox[i] = drawButton(14, top + i * (h + gap), 292, h, reqOptions[i].c_str(), optColor(reqOptions[i]));
   }
 }
 
@@ -380,12 +416,14 @@ void handleRequest() {
   reqId      = (const char*)(doc["id"]      | "");
   reqTitle   = (const char*)(doc["title"]   | "Agent request");
   reqSummary = (const char*)(doc["summary"] | "");
-  reqOptA = "Approve"; reqOptB = "Deny";
+  reqContext = (const char*)(doc["context"] | "");
+  reqCloud   = doc["cloud"] | false;
+  reqOptionCount = 0;
   if (doc["options"].is<JsonArray>()) {
-    JsonArray o = doc["options"].as<JsonArray>();
-    if (o.size() >= 1) reqOptA = o[0].as<String>();
-    if (o.size() >= 2) reqOptB = o[1].as<String>();
+    for (JsonVariant v : doc["options"].as<JsonArray>())
+      if (reqOptionCount < 4) reqOptions[reqOptionCount++] = v.as<String>();
   }
+  if (reqOptionCount == 0) { reqOptions[0] = "Approve"; reqOptions[1] = "Deny"; reqOptionCount = 2; }
   reqChoice = "";
   reqState = REQ_PENDING;
   screen = SCR_REQUEST;
@@ -475,8 +513,12 @@ void handleTouch() {
       break;
     case SCR_REQUEST:
       if (reqState == REQ_PENDING) {
-        if (hitBox(bApprove, x, y)) { tap(); reqChoice = reqOptA; reqState = REQ_ANSWERED; answeredAt = millis(); redraw(); }
-        else if (hitBox(bDeny, x, y)) { tap(); reqChoice = reqOptB; reqState = REQ_ANSWERED; answeredAt = millis(); redraw(); }
+        for (int i = 0; i < reqOptionCount; i++) {
+          if (hitBox(reqOptBox[i], x, y)) {
+            tap(); reqChoice = reqOptions[i]; reqState = REQ_ANSWERED; answeredAt = millis(); redraw();
+            break;
+          }
+        }
       }
       break;
     case SCR_PAIR:

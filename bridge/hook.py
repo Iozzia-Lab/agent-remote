@@ -90,6 +90,26 @@ def summarize(tool_name, tool_input):
     return tool_name, ""
 
 
+def session_label(event):
+    """A short human-readable label for this session, shown on the device so you
+    can tell concurrent sessions apart. Fallback chain:
+      1. AGENT_REMOTE env var  (you set it per session, e.g. `AGENT_REMOTE=... claude`)
+      2. project folder name from cwd / CLAUDE_PROJECT_DIR
+      3. short session_id tag
+    Claude Code does NOT expose the session name/title to hooks, so the env var
+    is the way to give a session your own name.
+    """
+    lbl = os.environ.get("AGENT_REMOTE", "").strip()
+    if lbl:
+        return lbl[:40]
+    cwd = event.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or ""
+    base = os.path.basename(cwd.rstrip("/")) if cwd else ""
+    if base:
+        return base[:40]
+    sid = event.get("session_id", "")
+    return ("#" + sid[:6]) if sid else "agent"
+
+
 def decide(permission, reason=""):
     """Emit the PreToolUse permission decision JSON and exit."""
     print(json.dumps({
@@ -133,6 +153,8 @@ def main():
         "summary": summary[:160],
         "detail": detail[:160],
         "options": cfg["options"],
+        "context": session_label(event),
+        "cloud": os.environ.get("CLAUDE_CODE_REMOTE") == "true",
     }
 
     url = base_url(cfg)
