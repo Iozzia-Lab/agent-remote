@@ -193,8 +193,11 @@ void handleSave() {
     prefs.putString("pass", pass);
     connectedIP = WiFi.localIP().toString();
     server.send(200, "text/html",
-      "<html><body style='font-family:sans-serif;background:#111;color:#eee;text-align:center;padding:40px'>"
-      "<h2 style='color:#0a7'>Connected!</h2><p>IP: " + connectedIP +
+      "<!doctype html><html><head><meta name=viewport "
+      "content='width=device-width,initial-scale=1'></head>"
+      "<body style='font-family:-apple-system,sans-serif;background:#111;color:#eee;"
+      "text-align:center;padding:40px 20px;font-size:22px'>"
+      "<h2 style='color:#0a7;font-size:34px'>Connected!</h2><p>IP: " + connectedIP +
       "</p><p>You can close this page. The device is now on your WiFi.</p></body></html>");
     // tear down the setup hotspot shortly, then show the connected screen
     delay(400);
@@ -203,8 +206,12 @@ void handleSave() {
     redraw();
   } else {
     server.send(200, "text/html",
-      "<html><body style='font-family:sans-serif;background:#111;color:#eee;text-align:center;padding:40px'>"
-      "<h2 style='color:#c33'>Could not connect</h2><p>Check the password and try again.</p>"
+      "<!doctype html><html><head><meta name=viewport "
+      "content='width=device-width,initial-scale=1'></head>"
+      "<body style='font-family:-apple-system,sans-serif;background:#111;color:#eee;"
+      "text-align:center;padding:40px 20px;font-size:22px'>"
+      "<h2 style='color:#c33;font-size:34px'>Could not connect</h2>"
+      "<p>Check the password and try again.</p>"
       "<a style='color:#0cf' href='/'>Back</a></body></html>");
   }
 }
