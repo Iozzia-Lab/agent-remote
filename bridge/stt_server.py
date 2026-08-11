@@ -1,108 +1,132 @@
 #!/usr/bin/env python3
 """
-agent-remote — local speech-to-text server.
+agent-remote — local speech-to-text server (streaming).
 
-Runs on your Mac (or any machine on the LAN). The Core2 records mic audio and
-POSTs it here as a WAV; this transcribes it locally with faster-whisper and
-returns {"text": "..."}. Audio never leaves your network — no API key, no cost.
+Runs on your Mac (or any LAN machine). The Core2 opens a WebSocket, streams mic
+audio (16 kHz mono PCM) continuously, and gets live partial transcripts back
+(Vosk) so text appears as you speak. On "stop", the full audio is re-transcribed
+once with Whisper for an accurate final transcript, which the device shows for
+review before sending. All local — no API key, no cloud.
 
 Run:
-    python3 bridge/stt_server.py            # model "base.en" on port 8766
-    STT_MODEL=small.en STT_PORT=8766 python3 bridge/stt_server.py
+    python3 bridge/stt_server.py
+Deps:
+    pip install faster-whisper vosk websockets
 
-First run downloads the model (~150 MB for base.en) from Hugging Face.
-
-Endpoints:
-    POST /transcribe   body = WAV audio  -> {"text": "..."}
-    GET  /health                          -> {"ok": true, "model": "..."}
+Ports:
+    ws://<host>:8766/        streaming: send binary PCM frames; send text "stop"
+                             -> receives {"partial": "..."} live, then {"final": "..."}
+    http://<host>:8767/health   {"ok": true}
 """
-import io
+import asyncio
 import json
 import os
-import tempfile
-import wave
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-MODEL_NAME = os.environ.get("STT_MODEL", "base.en")
-PORT = int(os.environ.get("STT_PORT", "8766"))
+import numpy as np
+import websockets
+from vosk import Model as VoskModel, KaldiRecognizer, SetLogLevel
 
-_model = None
+WS_PORT = int(os.environ.get("STT_PORT", "8766"))
+HTTP_PORT = WS_PORT + 1
+WHISPER_MODEL = os.environ.get("STT_MODEL", "base.en")
+SR = 16000
+
+SetLogLevel(-1)
+_vosk = None
+_whisper = None
 
 
-def get_model():
-    global _model
-    if _model is None:
+def get_vosk():
+    global _vosk
+    if _vosk is None:
+        print("[stt] loading Vosk streaming model (auto-downloads ~40MB first run)...")
+        _vosk = VoskModel(lang="en-us")
+        print("[stt] Vosk ready")
+    return _vosk
+
+
+def get_whisper():
+    global _whisper
+    if _whisper is None:
         from faster_whisper import WhisperModel
-        print(f"[stt] loading model '{MODEL_NAME}' (first run downloads it)...")
-        _model = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8")
-        print("[stt] model ready")
-    return _model
+        print(f"[stt] loading Whisper '{WHISPER_MODEL}' for final pass...")
+        _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+        print("[stt] Whisper ready")
+    return _whisper
 
 
-def transcribe_wav(data: bytes) -> str:
-    # Write to a temp WAV so faster-whisper can decode it via ffmpeg/av.
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        f.write(data)
-        path = f.name
+def whisper_final(pcm: bytes) -> str:
+    arr = np.frombuffer(pcm, np.int16).astype(np.float32) / 32768.0
+    if arr.size < SR // 4:          # < 0.25s of audio
+        return ""
+    segments, _ = get_whisper().transcribe(arr, beam_size=1, language="en")
+    return " ".join(s.text.strip() for s in segments).strip()
+
+
+async def ws_handler(ws):
+    print("[stt] client connected")
+    rec = KaldiRecognizer(get_vosk(), SR)
+    audio = bytearray()
+    finalized = ""
     try:
-        # Quick sanity: log duration if it's a valid WAV.
-        try:
-            with wave.open(io.BytesIO(data), "rb") as w:
-                dur = w.getnframes() / float(w.getframerate() or 1)
-                print(f"[stt] {len(data)} bytes, {dur:.1f}s, {w.getframerate()}Hz")
-        except Exception:
-            print(f"[stt] {len(data)} bytes (non-standard WAV header)")
-        segments, _info = get_model().transcribe(path, beam_size=1, language="en")
-        text = " ".join(s.text.strip() for s in segments).strip()
-        print(f"[stt] -> {text!r}")
-        return text
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+        async for msg in ws:
+            if isinstance(msg, (bytes, bytearray)):
+                audio += msg
+                if rec.AcceptWaveform(bytes(msg)):
+                    seg = json.loads(rec.Result()).get("text", "")
+                    if seg:
+                        finalized = (finalized + " " + seg).strip()
+                    live = finalized
+                else:
+                    part = json.loads(rec.PartialResult()).get("partial", "")
+                    live = (finalized + " " + part).strip()
+                await ws.send(json.dumps({"partial": live}))
+            else:  # text control frame
+                if msg == "stop":
+                    seg = json.loads(rec.FinalResult()).get("text", "")
+                    if seg:
+                        finalized = (finalized + " " + seg).strip()
+                    print(f"[stt] stop: {len(audio)} bytes, vosk={finalized!r}")
+                    text = whisper_final(bytes(audio)) or finalized
+                    print(f"[stt] whisper final={text!r}")
+                    await ws.send(json.dumps({"final": text}))
+                    break
+    except websockets.ConnectionClosed:
+        pass
+    print("[stt] client done")
 
 
-class Handler(BaseHTTPRequestHandler):
-    def _json(self, code, obj):
-        body = json.dumps(obj).encode()
-        self.send_response(code)
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"ok": True, "vosk": True, "whisper": WHISPER_MODEL}).encode()
+        self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):
-        if self.path.startswith("/health"):
-            self._json(200, {"ok": True, "model": MODEL_NAME})
-        else:
-            self._json(404, {"error": "not found"})
-
-    def do_POST(self):
-        if not self.path.startswith("/transcribe"):
-            self._json(404, {"error": "not found"})
-            return
-        n = int(self.headers.get("Content-Length", "0"))
-        data = self.rfile.read(n) if n else b""
-        if not data:
-            self._json(400, {"error": "empty body"})
-            return
-        try:
-            text = transcribe_wav(data)
-            self._json(200, {"text": text})
-        except Exception as e:
-            print(f"[stt] error: {e}")
-            self._json(500, {"error": str(e)})
-
     def log_message(self, *a):
-        pass  # quiet default access log
+        pass
+
+
+def run_http():
+    ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), HealthHandler).serve_forever()
+
+
+async def main_async():
+    async with websockets.serve(ws_handler, "0.0.0.0", WS_PORT, max_size=None):
+        print(f"[stt] streaming WS on ws://0.0.0.0:{WS_PORT}/  | health http://0.0.0.0:{HTTP_PORT}/health")
+        await asyncio.Future()
 
 
 def main():
-    print(f"[stt] agent-remote STT server on :{PORT}  (model {MODEL_NAME})")
-    print("[stt] warming up the model...")
-    get_model()
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    print("[stt] warming up models...")
+    get_vosk()
+    get_whisper()
+    threading.Thread(target=run_http, daemon=True).start()
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
-#include <HTTPClient.h>
+#include <WebSocketsClient.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <esp_random.h>
@@ -44,14 +44,21 @@ const uint16_t C_BLACK=0x0000, C_WHITE=0xFFFF, C_CYAN=0x07FF, C_YELLOW=0xFFE0,
 enum Screen { SCR_START, SCR_AP, SCR_QR, SCR_CONNECTED, SCR_REQUEST, SCR_PAIR, SCR_VOICE };
 Screen screen = SCR_START;
 
-// Voice-answer flow (speech-to-text)
+// Voice-answer flow (streaming speech-to-text)
 enum VoiceState { V_LISTENING, V_TRANSCRIBING, V_RESULT, V_ERROR };
 VoiceState voiceState = V_LISTENING;
-int16_t*  voiceBuf = nullptr;
-size_t    voiceSamples = 0;
+int16_t*  voiceBuf = nullptr;  // one mic chunk
 String    voiceTranscript;
 String    sttHost;             // IP of the machine that sent the request (runs STT)
-bool      voiceStopReq = false;
+WebSocketsClient webSocket;
+volatile bool wsConnected = false, wsDirty = false, wsGotFinal = false;
+String    wsLiveText, wsFinalText;
+// Non-blocking streaming: loop() drives the whole thing so touch/Stop/server stay
+// alive and the mic can never hang the device (timeouts + a hard cap guard it).
+bool      voiceActive = false;
+bool      voiceChunkPending = false;
+uint32_t  voiceConnectDeadline = 0, voiceMaxDeadline = 0, voiceFinalDeadline = 0;
+uint32_t  voiceChunkStart = 0, voiceLastLive = 0;
 bool   apActive = false;
 bool   apHasClient = false;
 bool   serverStarted = false;
@@ -100,8 +107,9 @@ Box  drawButton(int x, int y, int w, int h, const char* label, uint16_t color, b
 void titleBar();
 void drawStart(); void drawAP(); void drawQR(); void drawConnected(); void drawRequest(); void drawPair();
 void drawCarousel(); void handleCarouselTap(int x, int y);
-void drawVoice(); void drawMicButton(Box b);
-void startVoiceFlow(); void recordAudio(); String transcribeAudio();
+void drawVoice(); void drawMicButton(Box b); void drawLiveText();
+void startVoiceStream(); void voiceStreamStep(); void stopVoiceCapture(); void endVoiceCapture();
+void wsEvent(WStype_t type, uint8_t* payload, size_t len);
 bool hitBox(const Box& b, int x, int y);
 void redraw();
 bool tryConnect(const String& ssid, const String& pass, uint32_t timeoutMs);
@@ -398,96 +406,113 @@ void drawCarousel() {
   }
 }
 
-// ---- Voice answer: record -> transcribe (local Whisper) -> review -> send ----
-static void writeWavHeader(uint8_t* h, uint32_t dataLen, uint32_t sr) {
-  uint32_t chunk = 36 + dataLen, byteRate = sr * 2;
-  memcpy(h, "RIFF", 4);
-  h[4] = chunk; h[5] = chunk >> 8; h[6] = chunk >> 16; h[7] = chunk >> 24;
-  memcpy(h + 8, "WAVEfmt ", 8);
-  h[16] = 16; h[17] = 0; h[18] = 0; h[19] = 0;
-  h[20] = 1; h[21] = 0;                       // PCM
-  h[22] = 1; h[23] = 0;                       // mono
-  h[24] = sr; h[25] = sr >> 8; h[26] = sr >> 16; h[27] = sr >> 24;
-  h[28] = byteRate; h[29] = byteRate >> 8; h[30] = byteRate >> 16; h[31] = byteRate >> 24;
-  h[32] = 2; h[33] = 0;                       // block align
-  h[34] = 16; h[35] = 0;                      // bits
-  memcpy(h + 36, "data", 4);
-  h[40] = dataLen; h[41] = dataLen >> 8; h[42] = dataLen >> 16; h[43] = dataLen >> 24;
+// ---- Voice answer: stream mic -> live partials (Vosk) -> final (Whisper) ----
+void wsEvent(WStype_t type, uint8_t* payload, size_t len) {
+  if (type == WStype_CONNECTED)         wsConnected = true;
+  else if (type == WStype_DISCONNECTED) wsConnected = false;
+  else if (type == WStype_TEXT) {
+    JsonDocument d;
+    if (!deserializeJson(d, (const char*)payload, len)) {
+      if (!d["partial"].isNull()) { wsLiveText = (const char*)(d["partial"] | ""); wsDirty = true; }
+      else if (!d["final"].isNull()) { wsFinalText = (const char*)(d["final"] | ""); wsGotFinal = true; }
+    }
+  }
 }
 
-void recordAudio() {
-  size_t cap = VOICE_SR * VOICE_MAX_SEC;
-  if (!voiceBuf) voiceBuf = (int16_t*)heap_caps_malloc(cap * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-  voiceSamples = 0; voiceStopReq = false;
-  if (!voiceBuf) return;
+// Redraw only the live-text band during streaming (avoids full-screen flicker),
+// auto-scrolled so the newest words stay visible.
+void drawLiveText() {
+  int top = 34, regionH = 176 - top;
+  M5.Display.fillRect(2, top, 316, regionH, C_BLACK);
+  String txt = wsLiveText.length() ? wsLiveText : "listening...";
+  int ch = drawWrapped(txt, 12, top, 296, regionH, 0, C_WHITE);
+  if (ch > regionH) {
+    M5.Display.fillRect(2, top, 316, regionH, C_BLACK);
+    drawWrapped(txt, 12, top, 296, regionH, ch - regionH, C_WHITE);
+  }
+}
+
+void endVoiceCapture() {
+  M5.Mic.end();          // aborts any in-flight record (no blocking wait)
+  M5.Speaker.begin();
+  voiceChunkPending = false;
+}
+
+// Stop capturing and ask the server for the accurate Whisper final.
+void stopVoiceCapture() {
+  endVoiceCapture();
+  webSocket.sendTXT("stop");
+  voiceState = V_TRANSCRIBING;
+  voiceFinalDeadline = millis() + 20000;
+  redraw();
+}
+
+// NON-BLOCKING: just set things up and return. loop() drives voiceStreamStep().
+void startVoiceStream() {
+  if (sttHost.isEmpty()) { voiceState = V_ERROR; voiceActive = false; screen = SCR_VOICE; redraw(); return; }
+  wsLiveText = ""; wsFinalText = ""; wsGotFinal = false; wsConnected = false; wsDirty = false;
+  voiceChunkPending = false; descScroll = 0;
+  voiceState = V_LISTENING; screen = SCR_VOICE; redraw();
+
+  const size_t chunk = VOICE_SR / 10;   // 0.1s frames
+  if (!voiceBuf) voiceBuf = (int16_t*)heap_caps_malloc(chunk * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+  webSocket.begin(sttHost.c_str(), STT_PORT, "/");
+  webSocket.onEvent(wsEvent);
   M5.Speaker.end();
   M5.Mic.begin();
-  const size_t block = VOICE_SR / 5;         // 0.2s chunks
-  uint32_t start = millis();
-  int lastBar = -1;
-  while (voiceSamples + block <= cap) {
-    if (!M5.Mic.record(voiceBuf + voiceSamples, block, VOICE_SR)) break;
-    while (M5.Mic.isRecording()) delay(2);
-    voiceSamples += block;
-    int barw = (238 * (int)voiceSamples) / (int)cap;
-    if (barw != lastBar) { M5.Display.fillRect(41, 97, barw, 18, C_GREEN); lastBar = barw; }
-    M5.update();
-    auto t = M5.Touch.getDetail();
-    if (t.wasPressed() && hitBox(bVoiceStop, t.x, t.y)) { voiceStopReq = true; break; }
-    if (millis() - start > (uint32_t)VOICE_MAX_SEC * 1000) break;
-  }
-  M5.Mic.end();
-  M5.Speaker.begin();
+  uint32_t now = millis();
+  voiceConnectDeadline = now + 7000;
+  voiceMaxDeadline     = now + 60000;   // hard cap: can never run forever
+  voiceLastLive = 0;
+  voiceActive = true;
 }
 
-String transcribeAudio() {
-  if (sttHost.isEmpty() || voiceSamples == 0) return "";
-  uint32_t dataLen = voiceSamples * 2, wavLen = 44 + dataLen;
-  uint8_t* wav = (uint8_t*)heap_caps_malloc(wavLen, MALLOC_CAP_SPIRAM);
-  if (!wav) return "";
-  writeWavHeader(wav, dataLen, VOICE_SR);
-  memcpy(wav + 44, voiceBuf, dataLen);
-  HTTPClient http;
-  String url = "http://" + sttHost + ":" + String(STT_PORT) + "/transcribe";
-  Serial.printf("[voice] POST %s (%u bytes)\n", url.c_str(), (unsigned)wavLen);
-  http.begin(url);
-  http.addHeader("Content-Type", "audio/wav");
-  http.setTimeout(60000);
-  int code = http.POST(wav, wavLen);
-  String out;
-  if (code == 200) {
-    JsonDocument d;
-    if (!deserializeJson(d, http.getString())) out = (const char*)(d["text"] | "");
+// One non-blocking step, called every loop() while voiceActive. Never spins.
+void voiceStreamStep() {
+  webSocket.loop();
+  if (wsDirty && millis() - voiceLastLive > 200) {
+    wsDirty = false; voiceLastLive = millis();
+    if (screen == SCR_VOICE && voiceState == V_LISTENING) drawLiveText();
+  }
+  if (voiceState == V_LISTENING) {
+    if (!wsConnected) {
+      if (millis() > voiceConnectDeadline) {
+        endVoiceCapture(); webSocket.disconnect(); voiceState = V_ERROR; voiceActive = false; redraw();
+      }
+      return;
+    }
+    const size_t chunk = VOICE_SR / 10;
+    if (!M5.Mic.isRecording()) {
+      if (voiceChunkPending) { webSocket.sendBIN((uint8_t*)voiceBuf, chunk * 2); voiceChunkPending = false; }
+      if (voiceBuf && M5.Mic.record(voiceBuf, chunk, VOICE_SR)) { voiceChunkPending = true; voiceChunkStart = millis(); }
+    } else if (millis() - voiceChunkStart > 1000) {          // mic wedged -> bail safely
+      endVoiceCapture(); webSocket.disconnect(); voiceState = V_ERROR; voiceActive = false; redraw();
+      return;
+    }
+    if (millis() > voiceMaxDeadline) stopVoiceCapture();      // hard cap reached -> finalize
+  } else if (voiceState == V_TRANSCRIBING) {
+    if (wsGotFinal || millis() > voiceFinalDeadline) {
+      webSocket.disconnect();
+      if (wsGotFinal && wsFinalText.length())  voiceTranscript = wsFinalText;
+      else if (wsLiveText.length())            voiceTranscript = wsLiveText;
+      else { voiceState = V_ERROR; voiceActive = false; descScroll = 0; redraw(); return; }
+      voiceState = V_RESULT; voiceActive = false; descScroll = 0; redraw();
+    }
   } else {
-    Serial.printf("[voice] STT HTTP %d\n", code);
+    voiceActive = false;   // safety: nothing to do in other states
   }
-  http.end();
-  free(wav);
-  out.trim();
-  return out;
-}
-
-void startVoiceFlow() {
-  descScroll = 0;
-  voiceState = V_LISTENING; screen = SCR_VOICE; redraw();
-  recordAudio();
-  voiceState = V_TRANSCRIBING; redraw();
-  String txt = transcribeAudio();
-  if (txt.length()) { voiceTranscript = txt; voiceState = V_RESULT; descScroll = 0; }
-  else voiceState = V_ERROR;
-  redraw();
 }
 
 void drawVoice() {
   M5.Display.fillScreen(C_BLACK);
   M5.Display.drawRect(0, 0, 320, 240, C_WHITE);
   if (voiceState == V_LISTENING) {
-    centerText("Listening...", 160, 44, 3, C_CYAN);
-    M5.Display.drawRoundRect(40, 96, 240, 20, 4, C_GREY);   // progress bar (filled while recording)
-    bodyTextCentered(160, 144, "Speak, then tap Stop", C_DIM);
-    bVoiceStop = drawButton(90, 180, 140, 48, "Stop", C_RED);
+    M5.Display.setFont(&fonts::Font0); M5.Display.setTextSize(1); M5.Display.setTextColor(C_CYAN, C_BLACK);
+    M5.Display.setCursor(12, 10); M5.Display.print("Listening... speak now");
+    drawLiveText();
+    bVoiceStop = drawButton(90, 184, 140, 48, "Stop", C_RED);
   } else if (voiceState == V_TRANSCRIBING) {
-    centerText("Transcribing...", 160, 112, 3, C_CYAN);
+    centerText("Finalizing...", 160, 112, 3, C_CYAN);
   } else if (voiceState == V_RESULT) {
     M5.Display.setFont(&fonts::Font0); M5.Display.setTextSize(2);
     M5.Display.setTextColor(C_CYAN, C_BLACK); M5.Display.setCursor(12, 8); M5.Display.print("You said:");
@@ -518,7 +543,7 @@ void handleCarouselTap(int x, int y) {
   } else {
     if (hitBox(bSelect, x, y)) {
       M5.Speaker.tone(1200, 60);
-      if (carIdx == reqOptionCount) { startVoiceFlow(); }   // Voice answer item
+      if (carIdx == reqOptionCount) { startVoiceStream(); }   // Voice answer item
       else { carConfirm = true; descScroll = 0; redraw(); }
     }
     else if (hitBox(bPrev, x, y) && carIdx > 0) { M5.Speaker.tone(1200, 50); carIdx--; descScroll = 0; redraw(); }
@@ -821,9 +846,11 @@ void handleTouch() {
     return;
   }
 
-  // Voice review screen: scroll the transcript, or Redo/Send/Cancel.
+  // Voice: Stop while listening; scroll/Redo/Send while reviewing.
   if (screen == SCR_VOICE) {
-    if (voiceState == V_RESULT) {
+    if (voiceState == V_LISTENING) {
+      if (t.wasPressed() && hitBox(bVoiceStop, t.x, t.y)) stopVoiceCapture();
+    } else if (voiceState == V_RESULT) {
       if (!t.wasReleased()) return;
       int dx = t.x - touchStartX, dy = t.y - touchStartY;
       if (abs(dy) > 28 && abs(dy) > abs(dx)) {
@@ -835,10 +862,10 @@ void handleTouch() {
         reqChoice = voiceTranscript; reqState = REQ_ANSWERED; answeredAt = millis();
         screen = SCR_REQUEST; redraw();
       } else if (hitBox(bVoiceRedo, t.x, t.y)) {
-        M5.Speaker.tone(1200, 60); startVoiceFlow();
+        M5.Speaker.tone(1200, 60); startVoiceStream();
       }
     } else if (voiceState == V_ERROR && t.wasPressed()) {
-      if (hitBox(bVoiceRedo, t.x, t.y)) { M5.Speaker.tone(1200, 60); startVoiceFlow(); }
+      if (hitBox(bVoiceRedo, t.x, t.y)) { M5.Speaker.tone(1200, 60); startVoiceStream(); }
       else if (hitBox(bVoiceCancel, t.x, t.y)) { M5.Speaker.tone(1200, 60); screen = SCR_REQUEST; redraw(); }
     }
     return;
@@ -946,6 +973,7 @@ void setup() {
 void loop() {
   M5.update();
   if (serverStarted) server.handleClient();
+  if (voiceActive) voiceStreamStep();   // non-blocking mic streaming
   if (apActive) {
     dns.processNextRequest();
     if (screen == SCR_AP) {
