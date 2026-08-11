@@ -14,6 +14,7 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
+#include <esp_random.h>
 
 // ---- config ----
 static const char* AP_SSID      = "agent-remote-setup";
@@ -32,7 +33,7 @@ const uint16_t C_BLACK=0x0000, C_WHITE=0xFFFF, C_CYAN=0x07FF, C_YELLOW=0xFFE0,
                C_DGREY=0x2104, C_DIM=0x8410;
 
 // ---- screen state ----
-enum Screen { SCR_START, SCR_AP, SCR_QR, SCR_CONNECTED, SCR_REQUEST };
+enum Screen { SCR_START, SCR_AP, SCR_QR, SCR_CONNECTED, SCR_REQUEST, SCR_PAIR };
 Screen screen = SCR_START;
 bool   apActive = false;
 bool   apHasClient = false;
@@ -45,8 +46,17 @@ ReqState reqState = REQ_NONE;
 String   reqId, reqTitle, reqSummary, reqChoice, reqOptA = "Approve", reqOptB = "Deny";
 uint32_t answeredAt = 0;
 
+// ---- pairing / auth state ----
+String token;              // stored pairing token; empty = unpaired
+bool   paired = false;
+bool   pairingMode = false;
+uint32_t pairDeadline = 0;
+enum PairState { PAIR_IDLE, PAIR_PENDING, PAIR_APPROVED, PAIR_DENIED };
+PairState pairState = PAIR_IDLE;
+String pairClient, pairToken;
+
 struct Box { int x, y, w, h; };
-Box bSetup, bCancel, bNext, bBack, bRedo, bApprove, bDeny;
+Box bSetup, bCancel, bNext, bBack, bRedo, bApprove, bDeny, bPair;
 
 // forward decls
 void centerText(const char* s, int cx, int cy, int size, uint16_t fg);
@@ -54,13 +64,15 @@ void bodyText(int x, int y, const char* s, uint16_t fg);
 void bodyTextCentered(int cx, int y, const char* s, uint16_t fg);
 Box  drawButton(int x, int y, int w, int h, const char* label, uint16_t color, bool enabled = true);
 void titleBar();
-void drawStart(); void drawAP(); void drawQR(); void drawConnected(); void drawRequest();
+void drawStart(); void drawAP(); void drawQR(); void drawConnected(); void drawRequest(); void drawPair();
 void redraw();
 bool tryConnect(const String& ssid, const String& pass, uint32_t timeoutMs);
 void ensureServer(); void startMdns(); void startPortal(); void stopPortal();
 String portalHtml();
 void handleRoot(); void handleSave(); void handleNotFound();
 void handlePing(); void handleRequest(); void handleStatus(); void handleClear();
+void handlePair(); void handlePairStatus();
+bool authed(); String randomToken(); void enterPairing();
 void handleTouch();
 
 // =====================================================================
@@ -148,14 +160,34 @@ void drawQR() {
   bCancel = drawButton(170, 194, 130, 40, "Cancel", C_GREY);
 }
 
-// Idle screen once on WiFi: waiting for an agent request. Shows the address.
+// Idle screen once on WiFi: waiting for an agent request. Shows the address
+// and pairing status, with Pair + Re-do WiFi buttons.
 void drawConnected() {
   M5.Display.fillScreen(C_BLACK);
   titleBar();
-  centerText("Waiting for agent", 160, 86, 2, C_CYAN);
-  bodyTextCentered(160, 118, ("http://" + connectedIP).c_str(), C_LTGREY);
-  bodyTextCentered(160, 146, ("on " + wifiSsid).c_str(), C_DIM);
-  bRedo = drawButton(60, 196, 200, 36, "Re-do WiFi", C_GREY);
+  centerText("Waiting for agent", 160, 78, 2, C_CYAN);
+  bodyTextCentered(160, 106, ("http://" + connectedIP).c_str(), C_LTGREY);
+  if (paired) bodyTextCentered(160, 134, "Paired", C_GREEN);
+  else        bodyTextCentered(160, 134, "Not paired - tap Pair", C_YELLOW);
+  bPair = drawButton(20, 190, 135, 42, paired ? "Re-pair" : "Pair", paired ? C_GREY : C_GREEN);
+  bRedo = drawButton(165, 190, 135, 42, "Re-do WiFi", C_GREY);
+}
+
+// Pairing window: run pair.py, then confirm the requesting computer here.
+void drawPair() {
+  M5.Display.fillScreen(C_BLACK);
+  titleBar();
+  if (pairState == PAIR_PENDING) {
+    centerText("Pair with:", 160, 80, 2, C_WHITE);
+    bodyTextCentered(160, 108, pairClient.c_str(), C_CYAN);
+    bApprove = drawButton(14, 166, 140, 64, "Approve", C_GREEN);
+    bDeny    = drawButton(166, 166, 140, 64, "Deny", C_RED);
+  } else {
+    bodyTextCentered(160, 82, "Run  pair.py  on your computer", C_LTGREY);
+    int left = pairingMode ? (int)((pairDeadline - millis()) / 1000) : 0;
+    centerText((String(left) + "s").c_str(), 160, 124, 2, C_DIM);
+    bCancel = drawButton(90, 190, 140, 42, "Cancel", C_GREY);
+  }
 }
 
 // Approval prompt (or the brief "Sent" confirmation).
@@ -182,6 +214,7 @@ void redraw() {
     case SCR_QR:        drawQR();        break;
     case SCR_CONNECTED: drawConnected(); break;
     case SCR_REQUEST:   drawRequest();   break;
+    case SCR_PAIR:      drawPair();      break;
   }
 }
 
@@ -312,16 +345,33 @@ void stopPortal() {
 }
 
 // =====================================================================
-// Agent endpoints
+// Auth + agent endpoints
 // =====================================================================
+String randomToken() {
+  const char* hex = "0123456789abcdef";
+  String t;
+  for (int i = 0; i < 8; i++) {
+    uint32_t r = esp_random();
+    for (int b = 0; b < 8; b++) t += hex[(r >> (b * 4)) & 0xF];
+  }
+  return t;   // 64 hex chars
+}
+
+bool authed() {
+  if (!paired || token.isEmpty()) return false;
+  return server.hasHeader("X-Agent-Token") && server.header("X-Agent-Token") == token;
+}
+
 void handlePing() {
   String ip = WiFi.isConnected() ? WiFi.localIP().toString() : "";
   const char* st = reqState == REQ_PENDING ? "pending" : reqState == REQ_ANSWERED ? "answered" : "idle";
   server.send(200, "application/json",
-              "{\"ok\":true,\"device\":\"agent-remote\",\"ip\":\"" + ip + "\",\"state\":\"" + st + "\"}");
+              "{\"ok\":true,\"device\":\"agent-remote\",\"ip\":\"" + ip +
+              "\",\"paired\":" + (paired ? "true" : "false") + ",\"state\":\"" + st + "\"}");
 }
 
 void handleRequest() {
+  if (!authed()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
   JsonDocument doc;
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "application/json", "{\"error\":\"bad json\"}");
@@ -345,6 +395,7 @@ void handleRequest() {
 }
 
 void handleStatus() {
+  if (!authed()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
   String id = server.arg("id");
   String body;
   if (reqState == REQ_PENDING && (id == "" || id == reqId))
@@ -357,9 +408,41 @@ void handleStatus() {
 }
 
 void handleClear() {
+  if (!authed()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
   reqState = REQ_NONE; reqId = ""; reqChoice = "";
   if (screen == SCR_REQUEST) { screen = SCR_CONNECTED; redraw(); }
   server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// ---- pairing endpoints (unauthenticated; only work during the pairing window) ----
+void handlePair() {
+  if (!pairingMode) { server.send(403, "application/json", "{\"error\":\"not in pairing mode\"}"); return; }
+  if (pairState == PAIR_PENDING) { server.send(409, "application/json", "{\"error\":\"pairing busy\"}"); return; }
+  JsonDocument doc;
+  deserializeJson(doc, server.arg("plain"));
+  pairClient = (const char*)(doc["client"] | "a computer");
+  pairState = PAIR_PENDING;
+  screen = SCR_PAIR;
+  redraw();
+  M5.Speaker.tone(880, 120); delay(130); M5.Speaker.tone(1320, 160);
+  server.send(200, "application/json", "{\"status\":\"pending\"}");
+}
+
+void handlePairStatus() {
+  String body;
+  if (pairState == PAIR_APPROVED)      body = "{\"status\":\"approved\",\"token\":\"" + pairToken + "\"}";
+  else if (pairState == PAIR_DENIED)   body = "{\"status\":\"denied\"}";
+  else if (pairState == PAIR_PENDING)  body = "{\"status\":\"pending\"}";
+  else                                 body = pairingMode ? "{\"status\":\"waiting\"}" : "{\"status\":\"closed\"}";
+  server.send(200, "application/json", body);
+}
+
+void enterPairing() {
+  pairingMode = true;
+  pairState = PAIR_IDLE;
+  pairDeadline = millis() + 90000;
+  screen = SCR_PAIR;
+  redraw();
 }
 
 // =====================================================================
@@ -387,12 +470,33 @@ void handleTouch() {
       else if (hitBox(bCancel, x, y)) { tap(); stopPortal(); screen = SCR_START; redraw(); }
       break;
     case SCR_CONNECTED:
-      if (hitBox(bRedo, x, y)) { tap(); startPortal(); }
+      if (hitBox(bPair, x, y)) { tap(); enterPairing(); }
+      else if (hitBox(bRedo, x, y)) { tap(); startPortal(); }
       break;
     case SCR_REQUEST:
       if (reqState == REQ_PENDING) {
         if (hitBox(bApprove, x, y)) { tap(); reqChoice = reqOptA; reqState = REQ_ANSWERED; answeredAt = millis(); redraw(); }
         else if (hitBox(bDeny, x, y)) { tap(); reqChoice = reqOptB; reqState = REQ_ANSWERED; answeredAt = millis(); redraw(); }
+      }
+      break;
+    case SCR_PAIR:
+      if (pairState == PAIR_PENDING) {
+        if (hitBox(bApprove, x, y)) {
+          tap();
+          pairToken = randomToken();
+          token = pairToken; paired = true;
+          prefs.putString("token", token);
+          pairState = PAIR_APPROVED;
+          pairingMode = false;
+          screen = SCR_CONNECTED; redraw();
+          Serial.println("[agent-remote] paired");
+        } else if (hitBox(bDeny, x, y)) {
+          tap(); pairState = PAIR_DENIED; pairingMode = false;
+          screen = SCR_CONNECTED; redraw();
+        }
+      } else if (hitBox(bCancel, x, y)) {
+        tap(); pairingMode = false; pairState = PAIR_IDLE;
+        screen = SCR_CONNECTED; redraw();
       }
       break;
   }
@@ -414,13 +518,19 @@ void setup() {
   prefs.begin("agentremote", false);
   wifiSsid = prefs.getString("ssid", "");
   wifiPass = prefs.getString("pass", "");
+  token    = prefs.getString("token", "");
+  paired   = !token.isEmpty();
 
+  static const char* authHeaders[] = { "X-Agent-Token" };
+  server.collectHeaders(authHeaders, 1);
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/ping", handlePing);
   server.on("/request", HTTP_POST, handleRequest);
   server.on("/status", handleStatus);
   server.on("/clear", HTTP_POST, handleClear);
+  server.on("/pair", HTTP_POST, handlePair);
+  server.on("/pairstatus", handlePairStatus);
   server.onNotFound(handleNotFound);
 
   if (!wifiSsid.isEmpty()) {
@@ -453,6 +563,16 @@ void loop() {
   if (screen == SCR_REQUEST && reqState == REQ_ANSWERED && millis() - answeredAt > 2000) {
     screen = SCR_CONNECTED;
     redraw();
+  }
+  // Pairing window: tick the countdown and expire it.
+  if (pairingMode && pairState != PAIR_PENDING) {
+    static uint32_t lastTick = 0;
+    if (millis() > pairDeadline) {
+      pairingMode = false; pairState = PAIR_IDLE;
+      if (screen == SCR_PAIR) { screen = SCR_CONNECTED; redraw(); }
+    } else if (screen == SCR_PAIR && millis() - lastTick > 1000) {
+      lastTick = millis(); redraw();
+    }
   }
   handleTouch();
   delay(5);
