@@ -20,6 +20,7 @@
 // ---- config ----
 static const char* AP_SSID      = "agent-remote-setup";
 static const char* PORTAL_HOST  = "agent-remote.com";   // shown to the user; DNS maps it here
+static const char* PORTAL_URL   = "http://agent-remote.com";   // encoded in the QR code
 static const IPAddress AP_IP(192, 168, 4, 1);
 
 WebServer   server(80);
@@ -28,23 +29,28 @@ Preferences prefs;
 
 // ---- colors (RGB565) ----
 const uint16_t C_BLACK=0x0000, C_WHITE=0xFFFF, C_CYAN=0x07FF, C_YELLOW=0xFFE0,
-               C_GREY=0x4208, C_LTGREY=0xC618, C_GREEN=0x2605, C_RED=0xC000;
+               C_GREY=0x4208, C_LTGREY=0xC618, C_GREEN=0x2605, C_RED=0xC000,
+               C_DGREY=0x2104, C_DIM=0x8410;
 
 // ---- state ----
-enum Screen { SCR_START, SCR_AP, SCR_CONNECTED };
+enum Screen { SCR_START, SCR_AP, SCR_QR, SCR_CONNECTED };
 Screen screen = SCR_START;
 bool   apActive = false;
+bool   apHasClient = false;      // a phone has joined the setup hotspot
 bool   serverStarted = false;
 String wifiSsid, wifiPass, connectedIP;
 
 struct Box { int x, y, w, h; };
-Box btnPrimary;   // the one button on the current screen
+Box bSetup, bCancel, bNext, bBack, bRedo;   // per-screen buttons (only some set at a time)
 
 // forward decls
 void centerText(const char* s, int cx, int cy, int size, uint16_t fg);
-Box  drawButton(int x, int y, int w, int h, const char* label, uint16_t color);
+void bodyText(int x, int y, const char* s, uint16_t fg);
+void bodyTextCentered(int cx, int y, const char* s, uint16_t fg);
+Box  drawButton(int x, int y, int w, int h, const char* label, uint16_t color, bool enabled = true);
 void drawStart();
 void drawAP();
+void drawQR();
 void drawConnected();
 void redraw();
 void startPortal();
@@ -60,6 +66,7 @@ void handleTouch();
 // Drawing
 // =====================================================================
 void centerText(const char* s, int cx, int cy, int size, uint16_t fg) {
+  M5.Display.setFont(&fonts::Font0);
   M5.Display.setTextSize(size);
   M5.Display.setTextColor(fg, C_BLACK);
   int w = M5.Display.textWidth(s);
@@ -68,9 +75,32 @@ void centerText(const char* s, int cx, int cy, int size, uint16_t fg) {
   M5.Display.print(s);
 }
 
-Box drawButton(int x, int y, int w, int h, const char* label, uint16_t color) {
+// Slightly-larger, nicer proportional font for helper/body text (~13px tall).
+// NOTE: reset size to 1 up front — a prior title/button draw may have left it
+// at 2 or 3, which would scale this font into giant blobs.
+void bodyText(int x, int y, const char* s, uint16_t fg) {
+  M5.Display.setTextSize(1);
+  M5.Display.setFont(&fonts::FreeSans9pt7b);
+  M5.Display.setTextColor(fg, C_BLACK);
+  M5.Display.setCursor(x, y);
+  M5.Display.print(s);
+  M5.Display.setFont(&fonts::Font0);
+}
+
+void bodyTextCentered(int cx, int y, const char* s, uint16_t fg) {
+  M5.Display.setTextSize(1);
+  M5.Display.setFont(&fonts::FreeSans9pt7b);
+  M5.Display.setTextColor(fg, C_BLACK);
+  int w = M5.Display.textWidth(s);
+  M5.Display.setCursor(cx - w / 2, y);
+  M5.Display.print(s);
+  M5.Display.setFont(&fonts::Font0);
+}
+
+Box drawButton(int x, int y, int w, int h, const char* label, uint16_t color, bool enabled) {
   M5.Display.fillRoundRect(x, y, w, h, 10, color);
-  M5.Display.setTextColor(C_WHITE, color);
+  M5.Display.setFont(&fonts::Font0);
+  M5.Display.setTextColor(enabled ? C_WHITE : C_DIM, color);
   M5.Display.setTextSize(2);
   int tw = M5.Display.textWidth(label);
   int th = M5.Display.fontHeight();
@@ -88,50 +118,54 @@ void titleBar() {
 void drawStart() {
   M5.Display.fillScreen(C_BLACK);
   titleBar();
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(C_LTGREY, C_BLACK);
-  M5.Display.setCursor(20, 78);
-  M5.Display.print("This device needs WiFi.");
-  M5.Display.setCursor(20, 96);
-  M5.Display.print("Tap below, then follow the steps");
-  M5.Display.setCursor(20, 112);
-  M5.Display.print("on your phone.");
-  btnPrimary = drawButton(50, 160, 220, 56, "Set up WiFi", C_GREEN);
+  bodyText(20, 76,  "This device needs WiFi.", C_LTGREY);
+  bodyText(20, 100, "Tap below, then set it up", C_LTGREY);
+  bodyText(20, 122, "on your phone.", C_LTGREY);
+  bSetup = drawButton(50, 160, 220, 56, "Set up WiFi", C_GREEN);
 }
 
+// Step 1: join the hotspot, then tap Next (enabled once a phone has joined).
 void drawAP() {
   M5.Display.fillScreen(C_BLACK);
   titleBar();
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(C_LTGREY, C_BLACK);
-  M5.Display.setCursor(18, 74);  M5.Display.print("1. On your phone, join WiFi:");
+  bodyText(18, 72, "1. On your phone, join WiFi:", C_LTGREY);
+  M5.Display.setFont(&fonts::Font0);
   M5.Display.setTextColor(C_YELLOW, C_BLACK); M5.Display.setTextSize(2);
-  M5.Display.setCursor(28, 90);  M5.Display.print(AP_SSID);
-  M5.Display.setTextSize(1); M5.Display.setTextColor(C_LTGREY, C_BLACK);
-  M5.Display.setCursor(18, 118); M5.Display.print("2. The setup page opens by itself.");
-  M5.Display.setCursor(18, 134); M5.Display.print("   Or open in a browser:");
-  M5.Display.setTextColor(C_CYAN, C_BLACK); M5.Display.setTextSize(2);
-  M5.Display.setCursor(28, 150); M5.Display.print(PORTAL_HOST);
-  btnPrimary = drawButton(90, 186, 140, 44, "Cancel", C_GREY);
+  M5.Display.setCursor(28, 96); M5.Display.print(AP_SSID);
+  M5.Display.setTextSize(1);
+  if (apHasClient) bodyText(18, 132, "2. Connected! Tap Next.", C_GREEN);
+  else             bodyText(18, 132, "2. Connect above, then Next.", C_LTGREY);
+  bCancel = drawButton(20, 176, 130, 48, "Cancel", C_GREY);
+  bNext   = drawButton(170, 176, 130, 48, "Next",
+                       apHasClient ? C_GREEN : C_DGREY, apHasClient);
+}
+
+// Step 2: scan the QR to open the setup page.
+void drawQR() {
+  M5.Display.fillScreen(C_BLACK);
+  centerText("Scan to set up WiFi", 160, 16, 2, C_CYAN);
+  // M5GFX draws the QR on its own white background. 130px, centered.
+  M5.Display.qrcode(PORTAL_URL, (320 - 130) / 2, 32, 130, 3);
+  bodyTextCentered(160, 172, "or open  agent-remote.com", C_LTGREY);
+  bBack   = drawButton(20, 194, 130, 40, "Back", C_GREY);
+  bCancel = drawButton(170, 194, 130, 40, "Cancel", C_GREY);
 }
 
 void drawConnected() {
   M5.Display.fillScreen(C_BLACK);
   titleBar();
-  centerText("WiFi connected", 160, 96, 2, C_GREEN);
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(C_LTGREY, C_BLACK);
-  M5.Display.setCursor(20, 128); M5.Display.print("Network: "); M5.Display.print(wifiSsid);
-  M5.Display.setCursor(20, 146); M5.Display.print("IP: "); M5.Display.print(connectedIP);
-  M5.Display.setTextColor(C_GREY, C_BLACK);
-  M5.Display.setCursor(20, 176); M5.Display.print("(pairing + server come next)");
-  btnPrimary = drawButton(60, 196, 200, 36, "Re-do WiFi", C_GREY);
+  centerText("WiFi connected", 160, 90, 2, C_GREEN);
+  bodyText(20, 116, ("Network: " + wifiSsid).c_str(), C_LTGREY);
+  bodyText(20, 140, ("IP: " + connectedIP).c_str(), C_LTGREY);
+  bodyText(20, 170, "(pairing + server come next)", C_GREY);
+  bRedo = drawButton(60, 196, 200, 36, "Re-do WiFi", C_GREY);
 }
 
 void redraw() {
   switch (screen) {
     case SCR_START:     drawStart();     break;
     case SCR_AP:        drawAP();        break;
+    case SCR_QR:        drawQR();        break;
     case SCR_CONNECTED: drawConnected(); break;
   }
 }
@@ -230,6 +264,7 @@ void startPortal() {
   dns.start(53, "*", AP_IP);            // hijack every lookup -> this device
   if (!serverStarted) { server.begin(); serverStarted = true; }
   apActive = true;
+  apHasClient = false;                  // Next stays disabled until a phone joins
   screen = SCR_AP;
   redraw();
   Serial.printf("[agent-remote] portal up: join '%s' -> http://%s/\n", AP_SSID, PORTAL_HOST);
@@ -245,17 +280,30 @@ void stopPortal() {
 // =====================================================================
 // Touch
 // =====================================================================
+static bool hitBox(const Box& b, int x, int y) {
+  return x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h;
+}
+
 void handleTouch() {
   auto t = M5.Touch.getDetail();
   if (!t.wasPressed()) return;
-  Box b = btnPrimary;
-  bool hit = (t.x >= b.x && t.x <= b.x + b.w && t.y >= b.y && t.y <= b.y + b.h);
-  if (!hit) return;
-  M5.Speaker.tone(1200, 60);
+  int x = t.x, y = t.y;
+  auto tap = [&]() { M5.Speaker.tone(1200, 60); };
   switch (screen) {
-    case SCR_START:     startPortal(); break;
-    case SCR_AP:        stopPortal(); screen = SCR_START; redraw(); break;
-    case SCR_CONNECTED: startPortal(); break;   // "Re-do WiFi"
+    case SCR_START:
+      if (hitBox(bSetup, x, y))  { tap(); startPortal(); }
+      break;
+    case SCR_AP:
+      if (apHasClient && hitBox(bNext, x, y)) { tap(); screen = SCR_QR; redraw(); }
+      else if (hitBox(bCancel, x, y)) { tap(); stopPortal(); screen = SCR_START; redraw(); }
+      break;
+    case SCR_QR:
+      if (hitBox(bBack, x, y))   { tap(); screen = SCR_AP; redraw(); }
+      else if (hitBox(bCancel, x, y)) { tap(); stopPortal(); screen = SCR_START; redraw(); }
+      break;
+    case SCR_CONNECTED:
+      if (hitBox(bRedo, x, y))   { tap(); startPortal(); }
+      break;
   }
 }
 
@@ -299,6 +347,11 @@ void loop() {
   if (apActive) {
     dns.processNextRequest();
     server.handleClient();
+    // Enable "Next" once a phone joins the hotspot; redraw on change.
+    if (screen == SCR_AP) {
+      bool now = WiFi.softAPgetStationNum() > 0;
+      if (now != apHasClient) { apHasClient = now; redraw(); }
+    }
   }
   handleTouch();
   delay(5);
