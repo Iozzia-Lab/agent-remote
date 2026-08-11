@@ -12,9 +12,11 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <esp_random.h>
+#include <esp_heap_caps.h>
 
 // ---- config ----
 static const char* AP_SSID      = "agent-remote-setup";
@@ -22,6 +24,12 @@ static const char* PORTAL_HOST  = "agent-remote.com";
 static const char* PORTAL_URL   = "http://agent-remote.com";
 static const char* MDNS_NAME    = "agent-remote";          // http://agent-remote.local
 static const IPAddress AP_IP(192, 168, 4, 1);
+
+// Voice answer: record on the built-in mic, POST WAV to the local STT server
+// (bridge/stt_server.py) running on the machine that sent the request.
+static const int      STT_PORT  = 8766;
+static const uint32_t VOICE_SR  = 16000;
+static const int      VOICE_MAX_SEC = 8;
 
 WebServer   server(80);
 DNSServer   dns;
@@ -35,7 +43,15 @@ const uint16_t C_BLACK=0x0000, C_WHITE=0xFFFF, C_CYAN=0x07FF, C_YELLOW=0xFFE0,
 // ---- screen state ----
 enum Screen { SCR_START, SCR_AP, SCR_QR, SCR_CONNECTED, SCR_REQUEST, SCR_PAIR, SCR_VOICE };
 Screen screen = SCR_START;
-bool   voiceStopped = false;   // mock speech-to-text: false=listening, true=stopped
+
+// Voice-answer flow (speech-to-text)
+enum VoiceState { V_LISTENING, V_TRANSCRIBING, V_RESULT, V_ERROR };
+VoiceState voiceState = V_LISTENING;
+int16_t*  voiceBuf = nullptr;
+size_t    voiceSamples = 0;
+String    voiceTranscript;
+String    sttHost;             // IP of the machine that sent the request (runs STT)
+bool      voiceStopReq = false;
 bool   apActive = false;
 bool   apHasClient = false;
 bool   serverStarted = false;
@@ -73,7 +89,7 @@ struct Box { int x, y, w, h; };
 Box bSetup, bCancel, bNext, bBack, bRedo, bApprove, bDeny, bPair;
 Box reqOptBox[4];               // hit-boxes for the request option buttons
 Box bPrev, bNextC, bSelect, bConfirm;   // carousel controls
-Box bMic, bVoiceStop, bVoiceCancel, bVoiceBack;   // voice-answer mock
+Box bMic, bVoiceStop, bVoiceRedo, bVoiceSend, bVoiceCancel;   // voice-answer flow
 
 // forward decls
 void centerText(const char* s, int cx, int cy, int size, uint16_t fg);
@@ -85,6 +101,7 @@ void titleBar();
 void drawStart(); void drawAP(); void drawQR(); void drawConnected(); void drawRequest(); void drawPair();
 void drawCarousel(); void handleCarouselTap(int x, int y);
 void drawVoice(); void drawMicButton(Box b);
+void startVoiceFlow(); void recordAudio(); String transcribeAudio();
 bool hitBox(const Box& b, int x, int y);
 void redraw();
 bool tryConnect(const String& ssid, const String& pass, uint32_t timeoutMs);
@@ -349,10 +366,11 @@ void drawCarousel() {
     M5.Display.setCursor(sx + sw / 2 - M5.Display.textWidth(mainL.c_str()) / 2, sy + 6);
     M5.Display.print(mainL);
     String cnt = String(carIdx + 1) + " of " + String(total);
-    M5.Display.setTextSize(1);
-    M5.Display.setTextColor(carIdx == total - 1 ? C_YELLOW : C_LTGREY, sc);
-    M5.Display.setCursor(sx + sw / 2 - M5.Display.textWidth(cnt.c_str()) / 2, sy + 32);
+    M5.Display.setFont(&fonts::FreeSans9pt7b); M5.Display.setTextSize(1);
+    M5.Display.setTextColor(carIdx == total - 1 ? C_YELLOW : C_WHITE, sc);
+    M5.Display.setCursor(sx + sw / 2 - M5.Display.textWidth(cnt.c_str()) / 2, sy + 28);
     M5.Display.print(cnt);
+    M5.Display.setFont(&fonts::Font0);
     bSelect = { sx, sy, sw, sh };
   } else {
     centerText("Confirm choice", 160, 20, 2, C_CYAN);
@@ -380,22 +398,111 @@ void drawCarousel() {
   }
 }
 
-// Mocked speech-to-text screen (UI only — not wired up).
+// ---- Voice answer: record -> transcribe (local Whisper) -> review -> send ----
+static void writeWavHeader(uint8_t* h, uint32_t dataLen, uint32_t sr) {
+  uint32_t chunk = 36 + dataLen, byteRate = sr * 2;
+  memcpy(h, "RIFF", 4);
+  h[4] = chunk; h[5] = chunk >> 8; h[6] = chunk >> 16; h[7] = chunk >> 24;
+  memcpy(h + 8, "WAVEfmt ", 8);
+  h[16] = 16; h[17] = 0; h[18] = 0; h[19] = 0;
+  h[20] = 1; h[21] = 0;                       // PCM
+  h[22] = 1; h[23] = 0;                       // mono
+  h[24] = sr; h[25] = sr >> 8; h[26] = sr >> 16; h[27] = sr >> 24;
+  h[28] = byteRate; h[29] = byteRate >> 8; h[30] = byteRate >> 16; h[31] = byteRate >> 24;
+  h[32] = 2; h[33] = 0;                       // block align
+  h[34] = 16; h[35] = 0;                      // bits
+  memcpy(h + 36, "data", 4);
+  h[40] = dataLen; h[41] = dataLen >> 8; h[42] = dataLen >> 16; h[43] = dataLen >> 24;
+}
+
+void recordAudio() {
+  size_t cap = VOICE_SR * VOICE_MAX_SEC;
+  if (!voiceBuf) voiceBuf = (int16_t*)heap_caps_malloc(cap * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+  voiceSamples = 0; voiceStopReq = false;
+  if (!voiceBuf) return;
+  M5.Speaker.end();
+  M5.Mic.begin();
+  const size_t block = VOICE_SR / 5;         // 0.2s chunks
+  uint32_t start = millis();
+  int lastBar = -1;
+  while (voiceSamples + block <= cap) {
+    if (!M5.Mic.record(voiceBuf + voiceSamples, block, VOICE_SR)) break;
+    while (M5.Mic.isRecording()) delay(2);
+    voiceSamples += block;
+    int barw = (238 * (int)voiceSamples) / (int)cap;
+    if (barw != lastBar) { M5.Display.fillRect(41, 97, barw, 18, C_GREEN); lastBar = barw; }
+    M5.update();
+    auto t = M5.Touch.getDetail();
+    if (t.wasPressed() && hitBox(bVoiceStop, t.x, t.y)) { voiceStopReq = true; break; }
+    if (millis() - start > (uint32_t)VOICE_MAX_SEC * 1000) break;
+  }
+  M5.Mic.end();
+  M5.Speaker.begin();
+}
+
+String transcribeAudio() {
+  if (sttHost.isEmpty() || voiceSamples == 0) return "";
+  uint32_t dataLen = voiceSamples * 2, wavLen = 44 + dataLen;
+  uint8_t* wav = (uint8_t*)heap_caps_malloc(wavLen, MALLOC_CAP_SPIRAM);
+  if (!wav) return "";
+  writeWavHeader(wav, dataLen, VOICE_SR);
+  memcpy(wav + 44, voiceBuf, dataLen);
+  HTTPClient http;
+  String url = "http://" + sttHost + ":" + String(STT_PORT) + "/transcribe";
+  Serial.printf("[voice] POST %s (%u bytes)\n", url.c_str(), (unsigned)wavLen);
+  http.begin(url);
+  http.addHeader("Content-Type", "audio/wav");
+  http.setTimeout(60000);
+  int code = http.POST(wav, wavLen);
+  String out;
+  if (code == 200) {
+    JsonDocument d;
+    if (!deserializeJson(d, http.getString())) out = (const char*)(d["text"] | "");
+  } else {
+    Serial.printf("[voice] STT HTTP %d\n", code);
+  }
+  http.end();
+  free(wav);
+  out.trim();
+  return out;
+}
+
+void startVoiceFlow() {
+  descScroll = 0;
+  voiceState = V_LISTENING; screen = SCR_VOICE; redraw();
+  recordAudio();
+  voiceState = V_TRANSCRIBING; redraw();
+  String txt = transcribeAudio();
+  if (txt.length()) { voiceTranscript = txt; voiceState = V_RESULT; descScroll = 0; }
+  else voiceState = V_ERROR;
+  redraw();
+}
+
 void drawVoice() {
   M5.Display.fillScreen(C_BLACK);
   M5.Display.drawRect(0, 0, 320, 240, C_WHITE);
-  if (!voiceStopped) {
-    centerText("Listening...", 160, 40, 3, C_CYAN);
-    int bx = 64, by = 112, hs[9] = { 12, 26, 42, 22, 50, 18, 38, 28, 14 };
-    for (int i = 0; i < 9; i++) M5.Display.fillRoundRect(bx + i * 22, by - hs[i] / 2, 10, hs[i], 3, C_GREEN);
-    bodyTextCentered(160, 150, "speech-to-text (mock)", C_DIM);
-    bVoiceCancel = drawButton(20, 190, 140, 42, "Cancel", C_GREY);
-    bVoiceStop   = drawButton(166, 190, 140, 42, "Stop", C_RED);
-  } else {
-    centerText("Voice answer", 160, 46, 2, C_CYAN);
-    bodyTextCentered(160, 96,  "Speech-to-text isn't wired", C_LTGREY);
-    bodyTextCentered(160, 120, "up yet - coming soon.", C_LTGREY);
-    bVoiceBack = drawButton(90, 190, 140, 44, "Back", C_GREY);
+  if (voiceState == V_LISTENING) {
+    centerText("Listening...", 160, 44, 3, C_CYAN);
+    M5.Display.drawRoundRect(40, 96, 240, 20, 4, C_GREY);   // progress bar (filled while recording)
+    bodyTextCentered(160, 144, "Speak, then tap Stop", C_DIM);
+    bVoiceStop = drawButton(90, 180, 140, 48, "Stop", C_RED);
+  } else if (voiceState == V_TRANSCRIBING) {
+    centerText("Transcribing...", 160, 112, 3, C_CYAN);
+  } else if (voiceState == V_RESULT) {
+    M5.Display.setFont(&fonts::Font0); M5.Display.setTextSize(2);
+    M5.Display.setTextColor(C_CYAN, C_BLACK); M5.Display.setCursor(12, 8); M5.Display.print("You said:");
+    descRegionH = 176 - 38;
+    descContentH = drawWrapped(voiceTranscript, 12, 38, 296, descRegionH, descScroll, C_WHITE);
+    int maxS = descContentH - descRegionH;
+    if (descScroll > 0)                M5.Display.fillTriangle(302, 46, 294, 46, 298, 38, C_CYAN);
+    if (maxS > 0 && descScroll < maxS) M5.Display.fillTriangle(294, 168, 302, 168, 298, 176, C_CYAN);
+    bVoiceRedo = drawButton(14, 184, 140, 48, "Redo", C_GREY);
+    bVoiceSend = drawButton(166, 184, 140, 48, "Send", C_GREEN);
+  } else {  // V_ERROR
+    centerText("Could not transcribe", 160, 68, 2, C_RED);
+    bodyTextCentered(160, 106, "Is the STT server running?", C_DIM);
+    bVoiceRedo   = drawButton(14, 184, 140, 48, "Redo", C_GREY);
+    bVoiceCancel = drawButton(166, 184, 140, 48, "Cancel", C_GREY);
   }
 }
 
@@ -411,7 +518,7 @@ void handleCarouselTap(int x, int y) {
   } else {
     if (hitBox(bSelect, x, y)) {
       M5.Speaker.tone(1200, 60);
-      if (carIdx == reqOptionCount) { voiceStopped = false; screen = SCR_VOICE; redraw(); }  // Voice answer item
+      if (carIdx == reqOptionCount) { startVoiceFlow(); }   // Voice answer item
       else { carConfirm = true; descScroll = 0; redraw(); }
     }
     else if (hitBox(bPrev, x, y) && carIdx > 0) { M5.Speaker.tone(1200, 50); carIdx--; descScroll = 0; redraw(); }
@@ -585,6 +692,7 @@ void handlePing() {
 
 void handleRequest() {
   if (!authed()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
+  sttHost = server.client().remoteIP().toString();   // STT server runs on the requester
   JsonDocument doc;
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "application/json", "{\"error\":\"bad json\"}");
@@ -632,12 +740,14 @@ void handleStatus() {
   if (!authed()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
   String id = server.arg("id");
   String body;
-  if (reqState == REQ_PENDING && (id == "" || id == reqId))
+  if (reqState == REQ_PENDING && (id == "" || id == reqId)) {
     body = "{\"state\":\"pending\"}";
-  else if (reqState == REQ_ANSWERED && (id == "" || id == reqId))
-    body = "{\"state\":\"answered\",\"choice\":\"" + reqChoice + "\"}";
-  else
+  } else if (reqState == REQ_ANSWERED && (id == "" || id == reqId)) {
+    JsonDocument d; d["state"] = "answered"; d["choice"] = reqChoice;   // safe-encodes quotes/newlines
+    serializeJson(d, body);
+  } else {
     body = "{\"state\":\"none\"}";
+  }
   server.send(200, "application/json", body);
 }
 
@@ -711,6 +821,29 @@ void handleTouch() {
     return;
   }
 
+  // Voice review screen: scroll the transcript, or Redo/Send/Cancel.
+  if (screen == SCR_VOICE) {
+    if (voiceState == V_RESULT) {
+      if (!t.wasReleased()) return;
+      int dx = t.x - touchStartX, dy = t.y - touchStartY;
+      if (abs(dy) > 28 && abs(dy) > abs(dx)) {
+        int maxS = descContentH - descRegionH; if (maxS < 0) maxS = 0;
+        descScroll -= dy; if (descScroll < 0) descScroll = 0; if (descScroll > maxS) descScroll = maxS;
+        redraw();
+      } else if (hitBox(bVoiceSend, t.x, t.y)) {
+        M5.Speaker.tone(1200, 60);
+        reqChoice = voiceTranscript; reqState = REQ_ANSWERED; answeredAt = millis();
+        screen = SCR_REQUEST; redraw();
+      } else if (hitBox(bVoiceRedo, t.x, t.y)) {
+        M5.Speaker.tone(1200, 60); startVoiceFlow();
+      }
+    } else if (voiceState == V_ERROR && t.wasPressed()) {
+      if (hitBox(bVoiceRedo, t.x, t.y)) { M5.Speaker.tone(1200, 60); startVoiceFlow(); }
+      else if (hitBox(bVoiceCancel, t.x, t.y)) { M5.Speaker.tone(1200, 60); screen = SCR_REQUEST; redraw(); }
+    }
+    return;
+  }
+
   if (!t.wasPressed()) return;
   int x = t.x, y = t.y;
   auto tap = [&]() { M5.Speaker.tone(1200, 60); };
@@ -738,14 +871,6 @@ void handleTouch() {
             break;
           }
         }
-      }
-      break;
-    case SCR_VOICE:
-      if (!voiceStopped) {
-        if (hitBox(bVoiceStop, x, y)) { tap(); voiceStopped = true; redraw(); }
-        else if (hitBox(bVoiceCancel, x, y)) { tap(); screen = SCR_REQUEST; redraw(); }
-      } else if (hitBox(bVoiceBack, x, y)) {
-        tap(); voiceStopped = false; screen = SCR_REQUEST; redraw();
       }
       break;
     case SCR_PAIR:
