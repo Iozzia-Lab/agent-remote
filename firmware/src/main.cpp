@@ -33,8 +33,9 @@ const uint16_t C_BLACK=0x0000, C_WHITE=0xFFFF, C_CYAN=0x07FF, C_YELLOW=0xFFE0,
                C_DGREY=0x2104, C_DIM=0x8410;
 
 // ---- screen state ----
-enum Screen { SCR_START, SCR_AP, SCR_QR, SCR_CONNECTED, SCR_REQUEST, SCR_PAIR };
+enum Screen { SCR_START, SCR_AP, SCR_QR, SCR_CONNECTED, SCR_REQUEST, SCR_PAIR, SCR_VOICE };
 Screen screen = SCR_START;
+bool   voiceStopped = false;   // mock speech-to-text: false=listening, true=stopped
 bool   apActive = false;
 bool   apHasClient = false;
 bool   serverStarted = false;
@@ -45,9 +46,19 @@ enum ReqState { REQ_NONE, REQ_PENDING, REQ_ANSWERED };
 ReqState reqState = REQ_NONE;
 String   reqId, reqTitle, reqSummary, reqChoice, reqContext;
 String   reqOptions[4];         // up to 4 choices (approval or multiple-choice)
+String   reqOptDesc[4];         // optional per-option description (scenario text)
 int      reqOptionCount = 0;
 bool     reqCloud = false;      // request came from a cloud/Cowork session
 uint32_t answeredAt = 0;
+// carousel mode: one option per screen (big targets + room for descriptions),
+// browse with Prev/Next or swipe, then a Confirm step before committing.
+bool     carouselMode = false;
+int      carIdx = 0;
+bool     carConfirm = false;
+int      touchStartX = 0, touchStartY = 0;
+int      descScroll = 0;        // vertical scroll offset of the description
+int      descContentH = 0;      // measured full height of the description text
+int      descRegionH = 90;      // visible height of the description area
 
 // ---- pairing / auth state ----
 String token;              // stored pairing token; empty = unpaired
@@ -61,14 +72,20 @@ String pairClient, pairToken;
 struct Box { int x, y, w, h; };
 Box bSetup, bCancel, bNext, bBack, bRedo, bApprove, bDeny, bPair;
 Box reqOptBox[4];               // hit-boxes for the request option buttons
+Box bPrev, bNextC, bSelect, bConfirm;   // carousel controls
+Box bMic, bVoiceStop, bVoiceCancel, bVoiceBack;   // voice-answer mock
 
 // forward decls
 void centerText(const char* s, int cx, int cy, int size, uint16_t fg);
 void bodyText(int x, int y, const char* s, uint16_t fg);
 void bodyTextCentered(int cx, int y, const char* s, uint16_t fg);
+int  drawWrapped(const String& s, int x, int yTop, int w, int regionH, int scroll, uint16_t fg);
 Box  drawButton(int x, int y, int w, int h, const char* label, uint16_t color, bool enabled = true);
 void titleBar();
 void drawStart(); void drawAP(); void drawQR(); void drawConnected(); void drawRequest(); void drawPair();
+void drawCarousel(); void handleCarouselTap(int x, int y);
+void drawVoice(); void drawMicButton(Box b);
+bool hitBox(const Box& b, int x, int y);
 void redraw();
 bool tryConnect(const String& ssid, const String& pass, uint32_t timeoutMs);
 void ensureServer(); void startMdns(); void startPortal(); void stopPortal();
@@ -110,6 +127,40 @@ void bodyTextCentered(int cx, int y, const char* s, uint16_t fg) {
   M5.Display.setCursor(cx - w / 2, y);
   M5.Display.print(s);
   M5.Display.setFont(&fonts::Font0);
+}
+
+// Word-wrap `s` into width `w` and draw it clipped to a region of height
+// `regionH` starting at yTop, offset by `scroll`. Returns the full content
+// height (so the caller can compute how far it scrolls).
+int drawWrapped(const String& s, int x, int yTop, int w, int regionH, int scroll, uint16_t fg) {
+  M5.Display.setTextSize(1);
+  M5.Display.setFont(&fonts::FreeSans9pt7b);
+  M5.Display.setTextColor(fg, C_BLACK);
+  int lh = M5.Display.fontHeight() + 3;
+  M5.Display.setClipRect(x, yTop, w, regionH);
+  int line = 0;
+  int i = 0, n = s.length();
+  String cur = "";
+  auto flush = [&](const String& ln) {
+    int yy = yTop + line * lh - scroll;
+    if (yy + lh > yTop && yy < yTop + regionH) { M5.Display.setCursor(x, yy); M5.Display.print(ln); }
+    line++;
+  };
+  while (i < n) {
+    int j = i;
+    while (j < n && s[j] != ' ' && s[j] != '\n') j++;
+    String word = s.substring(i, j);
+    bool nl = (j < n && s[j] == '\n');
+    String trial = cur.length() ? cur + " " + word : word;
+    if (M5.Display.textWidth(trial.c_str()) > w && cur.length()) { flush(cur); cur = word; }
+    else cur = trial;
+    if (nl) { flush(cur); cur = ""; }
+    i = j + 1;
+  }
+  if (cur.length()) flush(cur);
+  M5.Display.clearClipRect();
+  M5.Display.setFont(&fonts::Font0);
+  return line * lh;
 }
 
 Box drawButton(int x, int y, int w, int h, const char* label, uint16_t color, bool enabled) {
@@ -213,6 +264,7 @@ void drawRequest() {
     centerText(reqChoice.c_str(), 160, 150, 3, optColor(reqChoice));
     return;
   }
+  if (carouselMode) { drawCarousel(); return; }
 
   // Context label (top-left), cloud marker (top-right).
   String ctx = reqContext.length() ? reqContext : "agent";
@@ -243,6 +295,130 @@ void drawRequest() {
   }
 }
 
+// Small microphone icon inside a button box.
+void drawMicButton(Box b) {
+  M5.Display.fillRoundRect(b.x, b.y, b.w, b.h, 5, 0x3D9F);
+  int cx = b.x + b.w / 2, cy = b.y + b.h / 2 - 1;
+  M5.Display.fillRoundRect(cx - 3, cy - 7, 6, 11, 3, C_WHITE);   // mic body
+  M5.Display.fillRect(cx - 1, cy + 4, 2, 4, C_WHITE);            // stem
+  M5.Display.drawFastHLine(cx - 4, cy + 8, 8, C_WHITE);          // base
+}
+
+// Carousel: one option per screen (browse), then a Confirm step. The last item
+// (index == reqOptionCount) is the "Voice answer" option. The "X of N" count
+// lives inside the Select button to save vertical space.
+void drawCarousel() {
+  M5.Display.setFont(&fonts::Font0); M5.Display.setTextSize(1);
+  bool isVoice = (carIdx == reqOptionCount);
+  int  total   = reqOptionCount + 1;
+
+  String ctx = reqContext.length() ? reqContext : "agent";
+  if (ctx.length() > 16) ctx = ctx.substring(0, 15) + "~";
+  M5.Display.setTextColor(C_YELLOW, C_BLACK); M5.Display.setCursor(10, 6); M5.Display.print(ctx);
+  if (reqCloud) { M5.Display.setTextColor(C_CYAN, C_BLACK); M5.Display.setCursor(150, 6); M5.Display.print("CLOUD"); }
+
+  int descTop;
+  String dsc;
+  if (!carConfirm) {
+    // question (one line)
+    M5.Display.setTextSize(1); M5.Display.setTextColor(C_CYAN, C_BLACK);
+    M5.Display.setTextWrap(false); M5.Display.setCursor(10, 26); M5.Display.print(reqSummary);
+    M5.Display.setTextWrap(true);
+    // label (numbered option, or the Voice answer item with a mic)
+    if (isVoice) {
+      drawMicButton({ 10, 44, 34, 26 });
+      M5.Display.setTextSize(2); M5.Display.setTextColor(C_WHITE, C_BLACK);
+      M5.Display.setCursor(54, 50); M5.Display.print("Voice answer");
+      dsc = "Speak your response instead of picking a listed option.";
+      descTop = 82;
+    } else {
+      M5.Display.setTextSize(2); M5.Display.setTextColor(C_WHITE, C_BLACK);
+      M5.Display.setCursor(10, 48); M5.Display.print(String(carIdx + 1) + ". " + reqOptions[carIdx]);
+      dsc = reqOptDesc[carIdx];
+      descTop = 74;
+    }
+    bPrev  = drawButton(8, 184, 54, 48, "<", carIdx > 0 ? C_GREY : C_DGREY, carIdx > 0);
+    bNextC = drawButton(258, 184, 54, 48, ">", carIdx < reqOptionCount ? C_GREY : C_DGREY, carIdx < reqOptionCount);
+    // Select button with the "X of N" count underneath.
+    int sx = 70, sy = 184, sw = 180, sh = 48;
+    uint16_t sc = isVoice ? 0x3D9F : C_GREEN;
+    M5.Display.fillRoundRect(sx, sy, sw, sh, 10, sc);
+    M5.Display.setFont(&fonts::Font0);
+    M5.Display.setTextColor(C_WHITE, sc); M5.Display.setTextSize(2);
+    String mainL = isVoice ? "Speak" : "Select";
+    M5.Display.setCursor(sx + sw / 2 - M5.Display.textWidth(mainL.c_str()) / 2, sy + 6);
+    M5.Display.print(mainL);
+    String cnt = String(carIdx + 1) + " of " + String(total);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(carIdx == total - 1 ? C_YELLOW : C_LTGREY, sc);
+    M5.Display.setCursor(sx + sw / 2 - M5.Display.textWidth(cnt.c_str()) / 2, sy + 32);
+    M5.Display.print(cnt);
+    bSelect = { sx, sy, sw, sh };
+  } else {
+    centerText("Confirm choice", 160, 20, 2, C_CYAN);
+    M5.Display.setFont(&fonts::Font0); M5.Display.setTextSize(2);
+    M5.Display.setTextColor(C_WHITE, C_BLACK);
+    M5.Display.setCursor(10, 48); M5.Display.print(String(carIdx + 1) + ". " + reqOptions[carIdx]);
+    dsc = reqOptDesc[carIdx];
+    descTop = 76;
+    bBack    = drawButton(14, 184, 140, 48, "Back", C_GREY);
+    bConfirm = drawButton(166, 184, 140, 48, "Confirm", C_GREEN);
+  }
+
+  // Scrollable description in the band between the label and the buttons.
+  descRegionH = 178 - descTop;
+  if (dsc.length()) {
+    descContentH = drawWrapped(dsc, 12, descTop, 292, descRegionH, descScroll, C_LTGREY);
+    int maxS = descContentH - descRegionH;
+    if (descScroll > 0)    M5.Display.fillTriangle(300, descTop + 8, 292, descTop + 8, 296, descTop, C_CYAN);
+    if (maxS > 0 && descScroll < maxS) {
+      int by = descTop + descRegionH - 2;
+      M5.Display.fillTriangle(292, by - 8, 300, by - 8, 296, by, C_CYAN);
+    }
+  } else {
+    descContentH = 0;
+  }
+}
+
+// Mocked speech-to-text screen (UI only — not wired up).
+void drawVoice() {
+  M5.Display.fillScreen(C_BLACK);
+  M5.Display.drawRect(0, 0, 320, 240, C_WHITE);
+  if (!voiceStopped) {
+    centerText("Listening...", 160, 40, 3, C_CYAN);
+    int bx = 64, by = 112, hs[9] = { 12, 26, 42, 22, 50, 18, 38, 28, 14 };
+    for (int i = 0; i < 9; i++) M5.Display.fillRoundRect(bx + i * 22, by - hs[i] / 2, 10, hs[i], 3, C_GREEN);
+    bodyTextCentered(160, 150, "speech-to-text (mock)", C_DIM);
+    bVoiceCancel = drawButton(20, 190, 140, 42, "Cancel", C_GREY);
+    bVoiceStop   = drawButton(166, 190, 140, 42, "Stop", C_RED);
+  } else {
+    centerText("Voice answer", 160, 46, 2, C_CYAN);
+    bodyTextCentered(160, 96,  "Speech-to-text isn't wired", C_LTGREY);
+    bodyTextCentered(160, 120, "up yet - coming soon.", C_LTGREY);
+    bVoiceBack = drawButton(90, 190, 140, 44, "Back", C_GREY);
+  }
+}
+
+void handleCarouselTap(int x, int y) {
+  if (carConfirm) {
+    if (hitBox(bConfirm, x, y)) {
+      M5.Speaker.tone(1200, 60);
+      reqChoice = reqOptions[carIdx]; reqState = REQ_ANSWERED; answeredAt = millis();
+      carConfirm = false; redraw();
+    } else if (hitBox(bBack, x, y)) {
+      M5.Speaker.tone(1200, 60); carConfirm = false; descScroll = 0; redraw();
+    }
+  } else {
+    if (hitBox(bSelect, x, y)) {
+      M5.Speaker.tone(1200, 60);
+      if (carIdx == reqOptionCount) { voiceStopped = false; screen = SCR_VOICE; redraw(); }  // Voice answer item
+      else { carConfirm = true; descScroll = 0; redraw(); }
+    }
+    else if (hitBox(bPrev, x, y) && carIdx > 0) { M5.Speaker.tone(1200, 50); carIdx--; descScroll = 0; redraw(); }
+    else if (hitBox(bNextC, x, y) && carIdx < reqOptionCount) { M5.Speaker.tone(1200, 50); carIdx++; descScroll = 0; redraw(); }
+  }
+}
+
 void redraw() {
   switch (screen) {
     case SCR_START:     drawStart();     break;
@@ -251,6 +427,7 @@ void redraw() {
     case SCR_CONNECTED: drawConnected(); break;
     case SCR_REQUEST:   drawRequest();   break;
     case SCR_PAIR:      drawPair();      break;
+    case SCR_VOICE:     drawVoice();     break;
   }
 }
 
@@ -418,12 +595,31 @@ void handleRequest() {
   reqSummary = (const char*)(doc["summary"] | "");
   reqContext = (const char*)(doc["context"] | "");
   reqCloud   = doc["cloud"] | false;
+  // options: array of strings, or objects {label, description}.
   reqOptionCount = 0;
   if (doc["options"].is<JsonArray>()) {
-    for (JsonVariant v : doc["options"].as<JsonArray>())
-      if (reqOptionCount < 4) reqOptions[reqOptionCount++] = v.as<String>();
+    for (JsonVariant v : doc["options"].as<JsonArray>()) {
+      if (reqOptionCount >= 4) break;
+      if (v.is<JsonObject>()) {
+        reqOptions[reqOptionCount] = v["label"].as<String>();
+        reqOptDesc[reqOptionCount] = (const char*)(v["description"] | "");
+      } else {
+        reqOptions[reqOptionCount] = v.as<String>();
+        reqOptDesc[reqOptionCount] = "";
+      }
+      reqOptionCount++;
+    }
   }
-  if (reqOptionCount == 0) { reqOptions[0] = "Approve"; reqOptions[1] = "Deny"; reqOptionCount = 2; }
+  if (reqOptionCount == 0) {
+    reqOptions[0] = "Approve"; reqOptDesc[0] = "";
+    reqOptions[1] = "Deny";    reqOptDesc[1] = "";
+    reqOptionCount = 2;
+  }
+  // Use the carousel (browse + confirm) for 3+ options or any described option;
+  // keep the fast two-button layout for simple Approve/Deny.
+  carouselMode = reqOptionCount >= 3;
+  for (int i = 0; i < reqOptionCount; i++) if (reqOptDesc[i].length()) carouselMode = true;
+  carIdx = 0; carConfirm = false; descScroll = 0;
   reqChoice = "";
   reqState = REQ_PENDING;
   screen = SCR_REQUEST;
@@ -486,12 +682,35 @@ void enterPairing() {
 // =====================================================================
 // Touch
 // =====================================================================
-static bool hitBox(const Box& b, int x, int y) {
+bool hitBox(const Box& b, int x, int y) {
   return x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h;
 }
 
 void handleTouch() {
   auto t = M5.Touch.getDetail();
+  if (t.wasPressed()) { touchStartX = t.x; touchStartY = t.y; }
+
+  // Carousel handles on RELEASE so we can distinguish a tap from a swipe.
+  if (screen == SCR_REQUEST && reqState == REQ_PENDING && carouselMode) {
+    if (!t.wasReleased()) return;
+    int dx = t.x - touchStartX, dy = t.y - touchStartY;
+    bool horiz = abs(dx) > 50 && abs(dx) > abs(dy);
+    bool vert  = abs(dy) > 28 && abs(dy) > abs(dx);
+    if (!carConfirm && horiz) {                        // browse options
+      if (dx < 0 && carIdx < reqOptionCount) { M5.Speaker.tone(1200, 50); carIdx++; descScroll = 0; redraw(); }
+      else if (dx > 0 && carIdx > 0) { M5.Speaker.tone(1200, 50); carIdx--; descScroll = 0; redraw(); }
+    } else if (vert) {                                 // scroll the description
+      int maxS = descContentH - descRegionH; if (maxS < 0) maxS = 0;
+      descScroll -= dy;
+      if (descScroll < 0) descScroll = 0;
+      if (descScroll > maxS) descScroll = maxS;
+      redraw();
+    } else {
+      handleCarouselTap(t.x, t.y);
+    }
+    return;
+  }
+
   if (!t.wasPressed()) return;
   int x = t.x, y = t.y;
   auto tap = [&]() { M5.Speaker.tone(1200, 60); };
@@ -519,6 +738,14 @@ void handleTouch() {
             break;
           }
         }
+      }
+      break;
+    case SCR_VOICE:
+      if (!voiceStopped) {
+        if (hitBox(bVoiceStop, x, y)) { tap(); voiceStopped = true; redraw(); }
+        else if (hitBox(bVoiceCancel, x, y)) { tap(); screen = SCR_REQUEST; redraw(); }
+      } else if (hitBox(bVoiceBack, x, y)) {
+        tap(); voiceStopped = false; screen = SCR_REQUEST; redraw();
       }
       break;
     case SCR_PAIR:
