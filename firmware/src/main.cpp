@@ -59,6 +59,7 @@ bool      voiceActive = false;
 bool      voiceChunkPending = false;
 uint32_t  voiceConnectDeadline = 0, voiceMaxDeadline = 0, voiceFinalDeadline = 0;
 uint32_t  voiceChunkStart = 0, voiceLastLive = 0;
+String    voiceBaseText;        // text kept before an "Add more" recording appends to it
 bool   apActive = false;
 bool   apHasClient = false;
 bool   serverStarted = false;
@@ -96,7 +97,7 @@ struct Box { int x, y, w, h; };
 Box bSetup, bCancel, bNext, bBack, bRedo, bApprove, bDeny, bPair;
 Box reqOptBox[4];               // hit-boxes for the request option buttons
 Box bPrev, bNextC, bSelect, bConfirm;   // carousel controls
-Box bMic, bVoiceStop, bVoiceRedo, bVoiceSend, bVoiceCancel;   // voice-answer flow
+Box bMic, bVoiceStop, bVoiceRedo, bVoiceSend, bVoiceCancel, bVoiceDel, bVoiceAdd;   // voice-answer flow
 
 // forward decls
 void centerText(const char* s, int cx, int cy, int size, uint16_t fg);
@@ -108,7 +109,7 @@ void titleBar();
 void drawStart(); void drawAP(); void drawQR(); void drawConnected(); void drawRequest(); void drawPair();
 void drawCarousel(); void handleCarouselTap(int x, int y);
 void drawVoice(); void drawMicButton(Box b); void drawLiveText();
-void startVoiceStream(); void voiceStreamStep(); void stopVoiceCapture(); void endVoiceCapture();
+void startVoiceStream(bool append = false); void voiceStreamStep(); void stopVoiceCapture(); void endVoiceCapture();
 void wsEvent(WStype_t type, uint8_t* payload, size_t len);
 bool hitBox(const Box& b, int x, int y);
 void redraw();
@@ -424,7 +425,9 @@ void wsEvent(WStype_t type, uint8_t* payload, size_t len) {
 void drawLiveText() {
   int top = 34, regionH = 176 - top;
   M5.Display.fillRect(2, top, 316, regionH, C_BLACK);
-  String txt = wsLiveText.length() ? wsLiveText : "listening...";
+  String live = wsLiveText;
+  String txt = voiceBaseText.length() ? (live.length() ? voiceBaseText + " " + live : voiceBaseText)
+                                      : (live.length() ? live : "listening...");
   int ch = drawWrapped(txt, 12, top, 296, regionH, 0, C_WHITE);
   if (ch > regionH) {
     M5.Display.fillRect(2, top, 316, regionH, C_BLACK);
@@ -448,8 +451,10 @@ void stopVoiceCapture() {
 }
 
 // NON-BLOCKING: just set things up and return. loop() drives voiceStreamStep().
-void startVoiceStream() {
+// append=true keeps the current transcript and appends the new dictation to it.
+void startVoiceStream(bool append) {
   if (sttHost.isEmpty()) { voiceState = V_ERROR; voiceActive = false; screen = SCR_VOICE; redraw(); return; }
+  voiceBaseText = append ? voiceTranscript : "";
   wsLiveText = ""; wsFinalText = ""; wsGotFinal = false; wsConnected = false; wsDirty = false;
   voiceChunkPending = false; descScroll = 0;
   voiceState = V_LISTENING; screen = SCR_VOICE; redraw();
@@ -493,9 +498,14 @@ void voiceStreamStep() {
   } else if (voiceState == V_TRANSCRIBING) {
     if (wsGotFinal || millis() > voiceFinalDeadline) {
       webSocket.disconnect();
-      if (wsGotFinal && wsFinalText.length())  voiceTranscript = wsFinalText;
-      else if (wsLiveText.length())            voiceTranscript = wsLiveText;
-      else { voiceState = V_ERROR; voiceActive = false; descScroll = 0; redraw(); return; }
+      String newText = (wsGotFinal && wsFinalText.length()) ? wsFinalText : wsLiveText;
+      newText.trim();
+      if (voiceBaseText.length())
+        voiceTranscript = newText.length() ? voiceBaseText + " " + newText : voiceBaseText;  // append
+      else
+        voiceTranscript = newText;
+      voiceTranscript.trim();
+      if (!voiceTranscript.length()) { voiceState = V_ERROR; voiceActive = false; descScroll = 0; redraw(); return; }
       voiceState = V_RESULT; voiceActive = false; descScroll = 0; redraw();
     }
   } else {
@@ -517,12 +527,22 @@ void drawVoice() {
     M5.Display.setFont(&fonts::Font0); M5.Display.setTextSize(2);
     M5.Display.setTextColor(C_CYAN, C_BLACK); M5.Display.setCursor(12, 8); M5.Display.print("You said:");
     descRegionH = 176 - 38;
-    descContentH = drawWrapped(voiceTranscript, 12, 38, 296, descRegionH, descScroll, C_WHITE);
+    String shown = voiceTranscript.length() ? voiceTranscript : "(empty - Add to dictate)";
+    descContentH = drawWrapped(shown, 12, 38, 296, descRegionH, descScroll,
+                               voiceTranscript.length() ? C_WHITE : C_DIM);
     int maxS = descContentH - descRegionH;
     if (descScroll > 0)                M5.Display.fillTriangle(302, 46, 294, 46, 298, 38, C_CYAN);
     if (maxS > 0 && descScroll < maxS) M5.Display.fillTriangle(294, 168, 302, 168, 298, 176, C_CYAN);
-    bVoiceRedo = drawButton(14, 184, 140, 48, "Redo", C_GREY);
-    bVoiceSend = drawButton(166, 184, 140, 48, "Send", C_GREEN);
+    // [Del] [Add] [Send]
+    bVoiceDel = { 14, 184, 92, 48 };
+    M5.Display.fillRoundRect(bVoiceDel.x, bVoiceDel.y, bVoiceDel.w, bVoiceDel.h, 10, 0x8800);  // muted red
+    { int cx = bVoiceDel.x + bVoiceDel.w / 2, cy = bVoiceDel.y + bVoiceDel.h / 2;   // backspace glyph
+      M5.Display.fillTriangle(cx - 16, cy, cx - 6, cy - 10, cx - 6, cy + 10, C_WHITE);
+      M5.Display.fillRect(cx - 6, cy - 10, 22, 20, C_WHITE);
+      M5.Display.drawLine(cx + 1, cy - 5, cx + 12, cy + 5, 0x8800);
+      M5.Display.drawLine(cx + 12, cy - 5, cx + 1, cy + 5, 0x8800); }
+    bVoiceAdd  = drawButton(114, 184, 92, 48, "Add", 0x3D9F);
+    bVoiceSend = drawButton(214, 184, 92, 48, "Send", C_GREEN);
   } else {  // V_ERROR
     centerText("Could not transcribe", 160, 68, 2, C_RED);
     bodyTextCentered(160, 106, "Is the STT server running?", C_DIM);
@@ -857,15 +877,21 @@ void handleTouch() {
         int maxS = descContentH - descRegionH; if (maxS < 0) maxS = 0;
         descScroll -= dy; if (descScroll < 0) descScroll = 0; if (descScroll > maxS) descScroll = maxS;
         redraw();
-      } else if (hitBox(bVoiceSend, t.x, t.y)) {
+      } else if (hitBox(bVoiceDel, t.x, t.y)) {           // trim the last word
+        M5.Speaker.tone(1500, 40);
+        voiceTranscript.trim();
+        int sp = voiceTranscript.lastIndexOf(' ');
+        voiceTranscript = (sp >= 0) ? voiceTranscript.substring(0, sp) : "";
+        descScroll = 0; redraw();
+      } else if (hitBox(bVoiceAdd, t.x, t.y)) {            // dictate more, append
+        M5.Speaker.tone(1200, 60); startVoiceStream(true);
+      } else if (voiceTranscript.length() && hitBox(bVoiceSend, t.x, t.y)) {
         M5.Speaker.tone(1200, 60);
         reqChoice = voiceTranscript; reqState = REQ_ANSWERED; answeredAt = millis();
         screen = SCR_REQUEST; redraw();
-      } else if (hitBox(bVoiceRedo, t.x, t.y)) {
-        M5.Speaker.tone(1200, 60); startVoiceStream();
       }
     } else if (voiceState == V_ERROR && t.wasPressed()) {
-      if (hitBox(bVoiceRedo, t.x, t.y)) { M5.Speaker.tone(1200, 60); startVoiceStream(); }
+      if (hitBox(bVoiceRedo, t.x, t.y)) { M5.Speaker.tone(1200, 60); startVoiceStream(false); }
       else if (hitBox(bVoiceCancel, t.x, t.y)) { M5.Speaker.tone(1200, 60); screen = SCR_REQUEST; redraw(); }
     }
     return;
