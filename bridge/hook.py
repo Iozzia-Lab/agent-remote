@@ -154,6 +154,7 @@ def main():
         "detail": detail[:160],
         "options": cfg["options"],
         "context": session_label(event),
+        "session": event.get("session_id", ""),   # keys the device's session tile
         "cloud": os.environ.get("CLAUDE_CODE_REMOTE") == "true",
     }
 
@@ -192,10 +193,16 @@ def main():
     if choice is None:
         log("no answer before timeout; clearing device and deferring")
         try:
-            http_json(f"{url}/clear", {}, method="POST", token=tok)
+            http_json(f"{url}/clear?id={req_id}", {}, method="POST", token=tok)
         except Exception:
             pass
         defer()
+
+    # Answered — clear this session's tile from the dashboard, then decide.
+    try:
+        http_json(f"{url}/clear?id={req_id}", {}, method="POST", token=tok)
+    except Exception:
+        pass
 
     if choice == cfg["deny_label"]:
         decide("deny", "Denied from agent-remote device")

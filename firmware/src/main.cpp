@@ -41,7 +41,7 @@ const uint16_t C_BLACK=0x0000, C_WHITE=0xFFFF, C_CYAN=0x07FF, C_YELLOW=0xFFE0,
                C_DGREY=0x2104, C_DIM=0x8410;
 
 // ---- screen state ----
-enum Screen { SCR_START, SCR_AP, SCR_QR, SCR_CONNECTED, SCR_REQUEST, SCR_PAIR, SCR_VOICE };
+enum Screen { SCR_START, SCR_AP, SCR_QR, SCR_CONNECTED, SCR_REQUEST, SCR_PAIR, SCR_VOICE, SCR_SETTINGS };
 Screen screen = SCR_START;
 
 // Voice-answer flow (streaming speech-to-text)
@@ -65,7 +65,7 @@ bool   apHasClient = false;
 bool   serverStarted = false;
 String wifiSsid, wifiPass, connectedIP;
 
-// ---- request state ----
+// ---- request state (the CURRENTLY-OPEN request; loaded from a session slot) ----
 enum ReqState { REQ_NONE, REQ_PENDING, REQ_ANSWERED };
 ReqState reqState = REQ_NONE;
 String   reqId, reqTitle, reqSummary, reqChoice, reqContext;
@@ -74,6 +74,26 @@ String   reqOptDesc[4];         // optional per-option description (scenario tex
 int      reqOptionCount = 0;
 bool     reqCloud = false;      // request came from a cloud/Cowork session
 uint32_t answeredAt = 0;
+
+// ---- multi-session dashboard ----
+// Each concurrent chat gets a slot; Home is a dashboard of them. A request is
+// stored in its slot (not auto-opened); the user taps a tile to handle it.
+#define MAX_SESS 6
+struct Session {
+  bool     used = false;
+  String   key;               // stable session id (or context/req-id fallback)
+  String   label;             // display name (context)
+  bool     cloud = false;
+  bool     hasReq = false;    // has a pending/answered request
+  bool     answered = false;
+  String   id, title, summary, choice;
+  String   options[4], optDesc[4];
+  int      optCount = 0;
+  bool     carousel = false;
+  uint32_t updated = 0;       // last activity (ms) — for ordering + aging
+};
+Session sessions[MAX_SESS];
+int  openSess = -1;           // index shown in SCR_REQUEST (-1 = none)
 // carousel mode: one option per screen (big targets + room for descriptions),
 // browse with Prev/Next or swipe, then a Confirm step before committing.
 bool     carouselMode = false;
@@ -95,6 +115,9 @@ String pairClient, pairToken;
 
 struct Box { int x, y, w, h; };
 Box bSetup, bCancel, bNext, bBack, bRedo, bApprove, bDeny, bPair;
+Box bGear, bWifi, bSessRow[MAX_SESS];   // home dashboard + settings
+int rowSession[MAX_SESS];               // visible row index -> session index
+int rowCount = 0;
 Box reqOptBox[4];               // hit-boxes for the request option buttons
 Box bPrev, bNextC, bSelect, bConfirm;   // carousel controls
 Box bMic, bVoiceStop, bVoiceRedo, bVoiceSend, bVoiceCancel, bVoiceDel, bVoiceAdd;   // voice-answer flow
@@ -107,6 +130,9 @@ int  drawWrapped(const String& s, int x, int yTop, int w, int regionH, int scrol
 Box  drawButton(int x, int y, int w, int h, const char* label, uint16_t color, bool enabled = true);
 void titleBar();
 void drawStart(); void drawAP(); void drawQR(); void drawConnected(); void drawRequest(); void drawPair();
+void drawSettings();
+int  findSessionByKey(const String& key); int findSessionById(const String& id); int allocSession();
+void openSession(int i); void answerOpenSession(const String& choice); int pendingCount();
 void drawCarousel(); void handleCarouselTap(int x, int y);
 void drawVoice(); void drawMicButton(Box b); void drawLiveText();
 void startVoiceStream(bool append = false); void voiceStreamStep(); void stopVoiceCapture(); void endVoiceCapture();
@@ -241,17 +267,59 @@ void drawQR() {
   bCancel = drawButton(170, 194, 130, 40, "Cancel", C_GREY);
 }
 
-// Idle screen once on WiFi: waiting for an agent request. Shows the address
-// and pairing status, with Pair + Re-do WiFi buttons.
+void drawGearIcon(int cx, int cy, uint16_t holeColor) {
+  M5.Display.fillCircle(cx, cy, 11, C_WHITE);
+  for (int a = 0; a < 360; a += 45) {
+    float r = a * 3.14159265f / 180.0f;
+    M5.Display.fillRect(cx + (int)(cosf(r) * 13) - 2, cy + (int)(sinf(r) * 13) - 2, 4, 4, C_WHITE);
+  }
+  M5.Display.fillCircle(cx, cy, 5, holeColor);
+}
+
+// Home = a dashboard of active chat sessions. Tap a tile to handle it; gear = Settings.
 void drawConnected() {
   M5.Display.fillScreen(C_BLACK);
+  M5.Display.drawRect(0, 0, 320, 240, C_WHITE);
+  M5.Display.drawRect(8, 8, 240, 44, C_CYAN);
+  centerText("Agent-remote", 128, 30, 3, C_WHITE);
+  bGear = { 258, 8, 54, 44 };
+  M5.Display.fillRoundRect(bGear.x, bGear.y, bGear.w, bGear.h, 8, C_GREY);
+  drawGearIcon(bGear.x + bGear.w / 2, bGear.y + bGear.h / 2, C_GREY);
+
+  rowCount = 0;
+  for (int i = 0; i < MAX_SESS && rowCount < 4; i++) {
+    if (!sessions[i].used || !sessions[i].hasReq) continue;
+    Session& s = sessions[i];
+    int y = 62 + rowCount * 42;
+    uint16_t stcol = s.answered ? C_GREEN : C_RED;
+    const char* sttxt = s.answered ? "responded" : "needs you";
+    M5.Display.drawRoundRect(10, y, 300, 38, 6, s.answered ? C_GREY : C_RED);
+    M5.Display.fillRoundRect(15, y + 8, 8, 22, 2, stcol);
+    M5.Display.setFont(&fonts::Font0); M5.Display.setTextSize(2); M5.Display.setTextColor(C_WHITE, C_BLACK);
+    String lbl = s.label.length() ? s.label : "agent";
+    if (lbl.length() > 13) lbl = lbl.substring(0, 12) + "~";
+    M5.Display.setCursor(32, y + 5); M5.Display.print(lbl);
+    if (s.cloud) { M5.Display.setTextSize(1); M5.Display.setTextColor(C_CYAN, C_BLACK); M5.Display.setCursor(32, y + 26); M5.Display.print("cloud"); }
+    M5.Display.setTextSize(1); M5.Display.setTextColor(stcol, C_BLACK);
+    M5.Display.setCursor(310 - M5.Display.textWidth(sttxt) - 6, y + 15); M5.Display.print(sttxt);
+    bSessRow[rowCount] = { 10, y, 300, 38 };
+    rowSession[rowCount] = i;
+    rowCount++;
+  }
+  if (rowCount == 0) {
+    centerText("Waiting for agent", 160, 108, 2, C_CYAN);
+    bodyTextCentered(160, 138, ("http://" + connectedIP).c_str(), C_LTGREY);
+    if (!paired) bodyTextCentered(160, 166, "Not paired - Settings > Pair", C_YELLOW);
+  }
+}
+
+void drawSettings() {
+  M5.Display.fillScreen(C_BLACK);
   titleBar();
-  centerText("Waiting for agent", 160, 78, 2, C_CYAN);
-  bodyTextCentered(160, 106, ("http://" + connectedIP).c_str(), C_LTGREY);
-  if (paired) bodyTextCentered(160, 134, "Paired", C_GREEN);
-  else        bodyTextCentered(160, 134, "Not paired - tap Pair", C_YELLOW);
-  bPair = drawButton(20, 190, 135, 42, paired ? "Re-pair" : "Pair", paired ? C_GREY : C_GREEN);
-  bRedo = drawButton(165, 190, 135, 42, "Re-do WiFi", C_GREY);
+  centerText("Settings", 160, 72, 2, C_CYAN);
+  bWifi = drawButton(30, 98,  260, 42, "WiFi Setup", C_GREY);
+  bPair = drawButton(30, 148, 260, 42, paired ? "Re-pair" : "Pair", paired ? C_GREY : C_GREEN);
+  bBack = drawButton(90, 200, 140, 34, "Back", C_GREY);
 }
 
 // Pairing window: run pair.py, then confirm the requesting computer here.
@@ -555,7 +623,7 @@ void handleCarouselTap(int x, int y) {
   if (carConfirm) {
     if (hitBox(bConfirm, x, y)) {
       M5.Speaker.tone(1200, 60);
-      reqChoice = reqOptions[carIdx]; reqState = REQ_ANSWERED; answeredAt = millis();
+      answerOpenSession(reqOptions[carIdx]);
       carConfirm = false; redraw();
     } else if (hitBox(bBack, x, y)) {
       M5.Speaker.tone(1200, 60); carConfirm = false; descScroll = 0; redraw();
@@ -580,6 +648,7 @@ void redraw() {
     case SCR_REQUEST:   drawRequest();   break;
     case SCR_PAIR:      drawPair();      break;
     case SCR_VOICE:     drawVoice();     break;
+    case SCR_SETTINGS:  drawSettings();  break;
   }
 }
 
@@ -735,6 +804,52 @@ void handlePing() {
               "\",\"paired\":" + (paired ? "true" : "false") + ",\"state\":\"" + st + "\"}");
 }
 
+int findSessionByKey(const String& key) {
+  for (int i = 0; i < MAX_SESS; i++) if (sessions[i].used && sessions[i].key == key) return i;
+  return -1;
+}
+int findSessionById(const String& id) {
+  for (int i = 0; i < MAX_SESS; i++) if (sessions[i].used && sessions[i].hasReq && sessions[i].id == id) return i;
+  return -1;
+}
+int allocSession() {
+  for (int i = 0; i < MAX_SESS; i++) if (!sessions[i].used) return i;
+  int oldest = 0;                                   // evict least-recently-updated
+  for (int i = 1; i < MAX_SESS; i++) if (sessions[i].updated < sessions[oldest].updated) oldest = i;
+  return oldest;
+}
+int pendingCount() {
+  int n = 0;
+  for (int i = 0; i < MAX_SESS; i++) if (sessions[i].used && sessions[i].hasReq && !sessions[i].answered) n++;
+  return n;
+}
+
+// Load a session's request into the render globals and show it.
+void openSession(int i) {
+  if (i < 0 || i >= MAX_SESS || !sessions[i].used || !sessions[i].hasReq) return;
+  Session& s = sessions[i];
+  openSess = i;
+  reqId = s.id; reqTitle = s.title; reqSummary = s.summary; reqContext = s.label; reqCloud = s.cloud;
+  reqOptionCount = s.optCount;
+  for (int k = 0; k < s.optCount; k++) { reqOptions[k] = s.options[k]; reqOptDesc[k] = s.optDesc[k]; }
+  carouselMode = s.carousel; carIdx = 0; carConfirm = false; descScroll = 0;
+  reqChoice = s.answered ? s.choice : "";
+  reqState = s.answered ? REQ_ANSWERED : REQ_PENDING;
+  answeredAt = millis();
+  screen = SCR_REQUEST;
+  redraw();
+}
+
+// Record the chosen answer back into the open session.
+void answerOpenSession(const String& choice) {
+  if (openSess >= 0 && openSess < MAX_SESS && sessions[openSess].used) {
+    sessions[openSess].answered = true;
+    sessions[openSess].choice = choice;
+    sessions[openSess].updated = millis();
+  }
+  reqChoice = choice; reqState = REQ_ANSWERED; answeredAt = millis();
+}
+
 void handleRequest() {
   if (!authed()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
   sttHost = server.client().remoteIP().toString();   // STT server runs on the requester
@@ -743,53 +858,51 @@ void handleRequest() {
     server.send(400, "application/json", "{\"error\":\"bad json\"}");
     return;
   }
-  reqId      = (const char*)(doc["id"]      | "");
-  reqTitle   = (const char*)(doc["title"]   | "Agent request");
-  reqSummary = (const char*)(doc["summary"] | "");
-  reqContext = (const char*)(doc["context"] | "");
-  reqCloud   = doc["cloud"] | false;
-  // options: array of strings, or objects {label, description}.
-  reqOptionCount = 0;
+  String id    = (const char*)(doc["id"]      | "");
+  String label = (const char*)(doc["context"] | "");
+  String key   = (const char*)(doc["session"] | "");
+  if (!key.length()) key = label;      // fall back to context, then to a per-request key
+  if (!key.length()) key = id;
+
+  int si = findSessionByKey(key);
+  if (si < 0) si = allocSession();
+  Session& s = sessions[si];
+  s.used = true; s.key = key; s.label = label.length() ? label : "agent";
+  s.cloud = doc["cloud"] | false;
+  s.id = id;
+  s.title = (const char*)(doc["title"] | "Agent request");
+  s.summary = (const char*)(doc["summary"] | "");
+  s.optCount = 0;
   if (doc["options"].is<JsonArray>()) {
     for (JsonVariant v : doc["options"].as<JsonArray>()) {
-      if (reqOptionCount >= 4) break;
-      if (v.is<JsonObject>()) {
-        reqOptions[reqOptionCount] = v["label"].as<String>();
-        reqOptDesc[reqOptionCount] = (const char*)(v["description"] | "");
-      } else {
-        reqOptions[reqOptionCount] = v.as<String>();
-        reqOptDesc[reqOptionCount] = "";
-      }
-      reqOptionCount++;
+      if (s.optCount >= 4) break;
+      if (v.is<JsonObject>()) { s.options[s.optCount] = v["label"].as<String>(); s.optDesc[s.optCount] = (const char*)(v["description"] | ""); }
+      else { s.options[s.optCount] = v.as<String>(); s.optDesc[s.optCount] = ""; }
+      s.optCount++;
     }
   }
-  if (reqOptionCount == 0) {
-    reqOptions[0] = "Approve"; reqOptDesc[0] = "";
-    reqOptions[1] = "Deny";    reqOptDesc[1] = "";
-    reqOptionCount = 2;
-  }
-  // Use the carousel (browse + confirm) for 3+ options or any described option;
-  // keep the fast two-button layout for simple Approve/Deny.
-  carouselMode = reqOptionCount >= 3;
-  for (int i = 0; i < reqOptionCount; i++) if (reqOptDesc[i].length()) carouselMode = true;
-  carIdx = 0; carConfirm = false; descScroll = 0;
-  reqChoice = "";
-  reqState = REQ_PENDING;
-  screen = SCR_REQUEST;
-  redraw();
+  if (s.optCount == 0) { s.options[0] = "Approve"; s.optDesc[0] = ""; s.options[1] = "Deny"; s.optDesc[1] = ""; s.optCount = 2; }
+  s.carousel = s.optCount >= 3;
+  for (int k = 0; k < s.optCount; k++) if (s.optDesc[k].length()) s.carousel = true;
+  s.hasReq = true; s.answered = false; s.choice = ""; s.updated = millis();
+
   M5.Speaker.tone(880, 120); delay(130); M5.Speaker.tone(1320, 160);
-  server.send(200, "application/json", "{\"ok\":true,\"id\":\"" + reqId + "\"}");
+  if (screen == SCR_CONNECTED) redraw();
+  else if (openSess == si && screen == SCR_REQUEST) openSession(si);   // refresh if it's open
+  server.send(200, "application/json", "{\"ok\":true,\"id\":\"" + id + "\"}");
 }
 
 void handleStatus() {
   if (!authed()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
-  String id = server.arg("id");
+  int si = findSessionById(server.arg("id"));
   String body;
-  if (reqState == REQ_PENDING && (id == "" || id == reqId)) {
-    body = "{\"state\":\"pending\"}";
-  } else if (reqState == REQ_ANSWERED && (id == "" || id == reqId)) {
-    JsonDocument d; d["state"] = "answered"; d["choice"] = reqChoice;   // safe-encodes quotes/newlines
-    serializeJson(d, body);
+  if (si >= 0 && sessions[si].hasReq) {
+    if (sessions[si].answered) {
+      JsonDocument d; d["state"] = "answered"; d["choice"] = sessions[si].choice;   // safe-encodes quotes/newlines
+      serializeJson(d, body);
+    } else {
+      body = "{\"state\":\"pending\"}";
+    }
   } else {
     body = "{\"state\":\"none\"}";
   }
@@ -798,8 +911,12 @@ void handleStatus() {
 
 void handleClear() {
   if (!authed()) { server.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
-  reqState = REQ_NONE; reqId = ""; reqChoice = "";
-  if (screen == SCR_REQUEST) { screen = SCR_CONNECTED; redraw(); }
+  int si = findSessionById(server.arg("id"));
+  if (si >= 0) {
+    sessions[si] = Session();   // free the slot
+    if (openSess == si && screen == SCR_REQUEST) { openSess = -1; reqState = REQ_NONE; screen = SCR_CONNECTED; }
+  }
+  if (screen == SCR_CONNECTED) redraw();
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -887,7 +1004,7 @@ void handleTouch() {
         M5.Speaker.tone(1200, 60); startVoiceStream(true);
       } else if (voiceTranscript.length() && hitBox(bVoiceSend, t.x, t.y)) {
         M5.Speaker.tone(1200, 60);
-        reqChoice = voiceTranscript; reqState = REQ_ANSWERED; answeredAt = millis();
+        answerOpenSession(voiceTranscript);
         screen = SCR_REQUEST; redraw();
       }
     } else if (voiceState == V_ERROR && t.wasPressed()) {
@@ -913,14 +1030,20 @@ void handleTouch() {
       else if (hitBox(bCancel, x, y)) { tap(); stopPortal(); screen = SCR_START; redraw(); }
       break;
     case SCR_CONNECTED:
-      if (hitBox(bPair, x, y)) { tap(); enterPairing(); }
-      else if (hitBox(bRedo, x, y)) { tap(); startPortal(); }
+      if (hitBox(bGear, x, y)) { tap(); screen = SCR_SETTINGS; redraw(); }
+      else for (int r = 0; r < rowCount; r++)
+        if (hitBox(bSessRow[r], x, y)) { tap(); openSession(rowSession[r]); break; }
+      break;
+    case SCR_SETTINGS:
+      if (hitBox(bWifi, x, y)) { tap(); startPortal(); }
+      else if (hitBox(bPair, x, y)) { tap(); enterPairing(); }
+      else if (hitBox(bBack, x, y)) { tap(); screen = SCR_CONNECTED; redraw(); }
       break;
     case SCR_REQUEST:
       if (reqState == REQ_PENDING) {
         for (int i = 0; i < reqOptionCount; i++) {
           if (hitBox(reqOptBox[i], x, y)) {
-            tap(); reqChoice = reqOptions[i]; reqState = REQ_ANSWERED; answeredAt = millis(); redraw();
+            tap(); answerOpenSession(reqOptions[i]); redraw();
             break;
           }
         }
@@ -1007,10 +1130,20 @@ void loop() {
       if (now != apHasClient) { apHasClient = now; redraw(); }
     }
   }
-  // Auto-return to idle a couple seconds after a tap.
+  // Auto-return to the dashboard a couple seconds after answering.
   if (screen == SCR_REQUEST && reqState == REQ_ANSWERED && millis() - answeredAt > 2000) {
+    openSess = -1; reqState = REQ_NONE;
     screen = SCR_CONNECTED;
     redraw();
+  }
+  // Age out answered sessions (30s) so the dashboard self-cleans.
+  {
+    bool changed = false;
+    for (int i = 0; i < MAX_SESS; i++)
+      if (sessions[i].used && sessions[i].answered && millis() - sessions[i].updated > 30000) {
+        sessions[i] = Session(); changed = true;
+      }
+    if (changed && screen == SCR_CONNECTED) redraw();
   }
   // Pairing window: tick the countdown and expire it.
   if (pairingMode && pairState != PAIR_PENDING) {
