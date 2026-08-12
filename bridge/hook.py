@@ -11,8 +11,10 @@ Config: bridge/agent-remote.config.json (see agent-remote.config.example.json).
 
 Hook I/O reference: https://docs.claude.com/en/docs/claude-code/hooks
 """
+import fnmatch
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -39,6 +41,11 @@ DEFAULTS = {
     "options": ["Approve", "Deny"],
     "allow_label": "Approve",
     "deny_label": "Deny",
+    # Only engage the device for calls Claude would ACTUALLY prompt on: skip
+    # anything your permission_mode or allow-rules already permit (they run
+    # silently), and anything your deny-rules block (Claude handles those). Set
+    # false to gate every tool in gate_tools regardless of your permissions.
+    "respect_permissions": True,
 }
 
 
@@ -127,6 +134,72 @@ def defer():
     sys.exit(0)
 
 
+# --- Approximate Claude Code's permission matching so the device only fires for
+#     calls Claude would actually PROMPT on (not ones your rules already allow). ---
+def _parse_rule(rule):
+    m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\((.*)\))?\s*$", rule or "")
+    return (m.group(1), m.group(2)) if m else (None, None)   # (tool, spec-or-None)
+
+
+def _bash_spec_matches(spec, cmd):
+    spec, cmd = spec.strip(), (cmd or "").strip()
+    if spec.endswith(":*"):                       # prefix rule, e.g. Bash(git commit:*)
+        prefix = spec[:-2].strip()
+        return cmd == prefix or cmd.startswith(prefix + " ")
+    if "*" in spec:                               # glob rule, e.g. Bash(npm run *)
+        return fnmatch.fnmatch(cmd, spec)
+    return cmd == spec                            # exact
+
+
+def rule_matches(rule, tool_name, tool_input):
+    tool, spec = _parse_rule(rule)
+    if tool != tool_name:
+        return False
+    if spec is None:
+        return True                               # whole-tool rule, e.g. "Bash"
+    ti = tool_input or {}
+    if tool_name == "Bash":
+        return _bash_spec_matches(spec, ti.get("command", ""))
+    target = ti.get("file_path") or ti.get("path") or ti.get("url") or ""
+    spec2 = spec.split(":", 1)[1] if spec.startswith("domain:") else spec
+    return fnmatch.fnmatch(target, spec2) or fnmatch.fnmatch(target, "*" + spec2 + "*")
+
+
+def load_permission_rules(cwd):
+    """Merge allow/deny rules from user + project Claude settings."""
+    paths = [os.path.expanduser("~/.claude/settings.json"),
+             os.path.expanduser("~/.claude/settings.local.json")]
+    if cwd:
+        paths += [os.path.join(cwd, ".claude", "settings.json"),
+                  os.path.join(cwd, ".claude", "settings.local.json")]
+    allow, deny = [], []
+    for p in paths:
+        try:
+            with open(p) as f:
+                perms = (json.load(f) or {}).get("permissions", {}) or {}
+            allow += perms.get("allow", []) or []
+            deny += perms.get("deny", []) or []
+        except Exception:
+            pass
+    return allow, deny
+
+
+def already_permitted(event, tool_name, tool_input, cfg):
+    """True if Claude would run this without prompting (so the device stays quiet)."""
+    if not cfg.get("respect_permissions", True):
+        return False
+    mode = event.get("permission_mode", "default")
+    if mode in ("bypassPermissions", "plan"):
+        return True
+    if mode == "acceptEdits" and tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        return True
+    allow, deny = load_permission_rules(event.get("cwd", ""))
+    # A deny match means Claude blocks it itself — no need to bother the device.
+    if any(rule_matches(r, tool_name, tool_input) for r in deny):
+        return True
+    return any(rule_matches(r, tool_name, tool_input) for r in allow)
+
+
 def main():
     cfg = load_config()
 
@@ -139,6 +212,10 @@ def main():
     tool_input = event.get("tool_input", {})
 
     if tool_name not in cfg["gate_tools"]:
+        defer()
+
+    # Only bother the device for calls Claude would actually stop and prompt on.
+    if already_permitted(event, tool_name, tool_input, cfg):
         defer()
 
     summary, detail = summarize(tool_name, tool_input)
