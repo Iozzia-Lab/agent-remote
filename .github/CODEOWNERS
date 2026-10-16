@@ -1,0 +1,11 @@
+config.php @saliozzia
+**/config.php @saliozzia
+keys.env* @saliozzia
+**/keys.env* @saliozzia
+/.github/ @saliozzia
+migrations/ @saliozzia
+**/migrations/ @saliozzia
+composer.json @saliozzia
+composer.lock @saliozzia
+package.json @saliozzia
+package-lock.json @saliozzia
